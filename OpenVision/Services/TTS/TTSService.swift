@@ -50,6 +50,15 @@ final class TTSService: NSObject, ObservableObject {
         return AVSpeechSynthesisVoice(language: "en-US")
     }
 
+    /// Russian replies need a Russian voice — an English voice reads Cyrillic as gibberish or
+    /// skips it. Keep the user's chosen voice when it already speaks Russian.
+    private func voice(for text: String) -> AVSpeechSynthesisVoice? {
+        let isCyrillic = text.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+        guard isCyrillic else { return selectedVoice }
+        if let chosen = selectedVoice, chosen.language.hasPrefix("ru") { return chosen }
+        return Self.availableVoices(for: "ru").first ?? AVSpeechSynthesisVoice(language: "ru-RU")
+    }
+
     /// Get all available voices for a language
     static func availableVoices(for languageCode: String = "en") -> [AVSpeechSynthesisVoice] {
         return AVSpeechSynthesisVoice.speechVoices()
@@ -129,7 +138,7 @@ final class TTSService: NSObject, ObservableObject {
     /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = selectedVoice
+        utterance.voice = voice(for: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0

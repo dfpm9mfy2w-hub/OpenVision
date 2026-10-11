@@ -13,6 +13,7 @@ import Foundation
 import Network
 import Combine
 import UIKit
+import CryptoKit
 
 /// OpenClaw WebSocket Service
 ///
@@ -57,7 +58,29 @@ final class OpenClawService: ObservableObject {
     private var authToken: String {
         SettingsManager.shared.settings.openClawAuthToken
     }
+    private let deviceTokenKey = "OpenClaw.deviceToken"
 
+    private var storedDeviceToken: String? {
+        get {
+            UserDefaults.standard.string(forKey: deviceTokenKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: deviceTokenKey)
+        }
+    }
+        private let deviceIdentityKey = "OpenClaw.deviceIdentity"
+
+        private lazy var devicePrivateKey: Curve25519.Signing.PrivateKey = {
+            if let data = UserDefaults.standard.data(forKey: deviceIdentityKey),
+               let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: data) {
+                return key
+            }
+
+            let key = Curve25519.Signing.PrivateKey()
+            UserDefaults.standard.set(key.rawRepresentation, forKey: deviceIdentityKey)
+            return key
+        }()
+        
     // MARK: - Callbacks
 
     /// Called when agent sends a text response
@@ -240,38 +263,22 @@ final class OpenClawService: ObservableObject {
 
             // Start receive loop
             startReceiving()
+            // Handshake is sent after connect.challenge
+            debugInfo = "Waiting for gateway challenge..."
+            
+            let deadline = Date().addingTimeInterval(15)
 
-            // Wait for connection (up to 10 seconds)
-            debugInfo = "Waiting for connection..."
-            var connected = false
-            for _ in 0..<50 {
-                guard !Task.isCancelled else {
-                    closeWebSocket()
-                    return
+            while !connectionState.isUsable {
+                if Date() >= deadline {
+                    throw AIBackendError.connectionFailed
                 }
-                if webSocket?.state == .running {
-                    connected = true
-                    break
+
+                if case .failed(let message) = connectionState {
+                    throw AIBackendError.requestFailed(message)
                 }
-                try? await Task.sleep(nanoseconds: 200_000_000)
+
+                try await Task.sleep(nanoseconds: 100_000_000)
             }
-
-            guard connected else {
-                throw AIBackendError.connectionTimeout
-            }
-
-            guard !Task.isCancelled else {
-                closeWebSocket()
-                return
-            }
-
-            // Send handshake
-            debugInfo = "Sending handshake..."
-            try await sendHandshake()
-
-            transition(to: .connected)
-            debugInfo = "Connected!"
-            print("[OpenClaw] Connected successfully")
 
         } catch is CancellationError {
             closeWebSocket()
@@ -311,26 +318,22 @@ final class OpenClawService: ObservableObject {
 
     /// Build WebSocket URL with authentication
     private func buildWebSocketURL() -> URL? {
-        guard var components = URLComponents(url: gatewayURL!, resolvingAgainstBaseURL: false) else {
+        guard var components = URLComponents(
+            url: gatewayURL!,
+            resolvingAgainstBaseURL: false
+        ) else {
             return nil
         }
 
-        // Ensure WebSocket scheme
         if components.scheme == "https" {
             components.scheme = "wss"
         } else if components.scheme == "http" {
             components.scheme = "ws"
         }
 
-        // Add path if needed
-        if components.path.isEmpty {
-            components.path = "/ws"
-        }
-
-        // Add token
-        var queryItems = components.queryItems ?? []
-        queryItems.append(URLQueryItem(name: "token", value: authToken))
-        components.queryItems = queryItems
+        // OpenClaw Gateway uses the root WebSocket endpoint.
+        // Authentication is sent inside the "connect" frame,
+        // not as a URL query parameter.
 
         return components.url
     }
@@ -358,32 +361,6 @@ final class OpenClawService: ObservableObject {
 
     // MARK: - Handshake
 
-    /// Send initial connect handshake
-    private func sendHandshake() async throws {
-        // Match xmeta's handshake format exactly
-        let params: [String: Any] = [
-            "minProtocol": 3,
-            "maxProtocol": 3,
-            "client": [
-                "id": "cli",
-                "displayName": "OpenVision",
-                "version": "1.0.0",
-                "platform": "ios",
-                "mode": "cli"
-            ],
-            "caps": [String](), // Empty array like xmeta
-            "auth": ["token": authToken],
-            "locale": "en-US",
-            "userAgent": "OpenVision/1.0.0"
-        ]
-
-        let response = try await sendRequest(method: .connect, params: params)
-
-        guard response.ok else {
-            let errorMsg = response.error?.message ?? "Handshake failed"
-            throw AIBackendError.requestFailed(errorMsg)
-        }
-    }
 
     // MARK: - Send Message
 
@@ -468,7 +445,7 @@ final class OpenClawService: ObservableObject {
 
     /// Send a request and wait for response
     private func sendRequest(method: OpenClawMethod, params: [String: Any]) async throws -> OpenClawResponse {
-        guard let webSocket = webSocket, webSocket.state == .running else {
+        guard let webSocket = webSocket else {
             throw AIBackendError.notConnected
         }
 
@@ -484,7 +461,7 @@ final class OpenClawService: ObservableObject {
             // Store continuation first
             pendingRequests[requestId] = continuation
 
-            webSocket.send(.data(data)) { [weak self] error in
+            webSocket.send(.string(String(data: data, encoding: .utf8)!)) { [weak self] error in
                 if let error = error {
                     // Only resume if we can remove from pending (prevents double-resume)
                     Task { @MainActor in
@@ -523,7 +500,7 @@ final class OpenClawService: ObservableObject {
     /// Handle incoming WebSocket message
     private func handleMessage(_ message: URLSessionWebSocketTask.Message) async {
         let data: Data
-
+        
         switch message {
         case .data(let d):
             data = d
@@ -532,26 +509,40 @@ final class OpenClawService: ObservableObject {
         @unknown default:
             return
         }
-
+        
         // Try to decode as response
         if let response = try? JSONDecoder().decode(OpenClawResponse.self, from: data),
            response.type == "res" {
             handleResponse(response)
             return
         }
-
+        
         // Try to decode as event
         if let event = try? JSONDecoder().decode(OpenClawEvent.self, from: data),
            event.type == "event" {
-            handleEvent(event)
+            
+            // OpenClaw requires the connect handshake to start
+            // after receiving the gateway-issued challenge.
+            // Run it in its own task: the handshake waits for the gateway's reply, and that
+            // reply is delivered by this same receive loop — awaiting it here deadlocked the
+            // loop until the 15s connect timeout fired.
+            if event.event == "connect.challenge" {
+                Task { await self.handleConnectChallenge(event) }
+            } else {
+                await handleEvent(event)
+            }
+            
             return
         }
-
-        print("[OpenClaw] Unknown message type")
     }
-
     /// Handle response to a request
     private func handleResponse(_ response: OpenClawResponse) {
+        if let payload = response.payload,
+           let auth = payload["auth"]?.value as? [String: Any],
+           let deviceToken = auth["deviceToken"] as? String {
+            storedDeviceToken = deviceToken
+            print("[OpenClaw] Device token saved")
+        }
         guard let continuation = pendingRequests.removeValue(forKey: response.id) else {
             print("[OpenClaw] No pending request for \(response.id)")
             return
@@ -562,9 +553,189 @@ final class OpenClawService: ObservableObject {
 
     /// Accumulated response text for streaming
     private var accumulatedResponse: String = ""
+    
+    /// Handle the Gateway connect.challenge event and complete the handshake.
+    private func handleConnectChallenge(_ event: OpenClawEvent) async {
+        guard let payload = event.payload else {
+            print("[OpenClaw] connect.challenge without payload")
+            return
+        }
+
+        guard
+            let nonce = payload["nonce"]?.stringValue,
+            !nonce.isEmpty,
+            let ts = payload["ts"]?.intValue,
+            ts >= 0
+        else {
+            print("[OpenClaw] Invalid connect.challenge payload")
+            transition(to: .failed("Invalid gateway challenge"))
+            return
+        }
+
+        print("[OpenClaw] Received connect.challenge nonce=\(nonce.prefix(12))... ts=\(ts)")
+
+        do {
+            try await sendConnectHandshake(nonce: nonce, signedAt: ts)
+            transition(to: .connected)
+            debugInfo = "Connected!"
+            print("[OpenClaw] Connected successfully")
+        } catch {
+            print("[OpenClaw] Handshake failed: \(error)")
+            lastError = error.localizedDescription
+            transition(to: .failed("Handshake failed: \(error.localizedDescription)"))
+        }
+    }
+
+    /// Send the OpenClaw connect request signed with the device identity.
+    private func sendConnectHandshake(nonce: String, signedAt: Int) async throws {
+
+        let role = "operator"
+
+        // Keep this aligned with the capabilities required by OpenVision.
+        let scopes = [
+            "operator.read",
+            "operator.write"
+        ]
+
+        let clientId = "openclaw-ios"
+        let clientMode = "ui"
+        let platform = "ios"
+        let deviceFamily = "ios"
+
+        // Raw Ed25519 public key.
+        let publicKeyRaw = devicePrivateKey.publicKey.rawRepresentation
+        print("[OpenClaw] PUBLIC KEY = \(base64URLEncode(publicKeyRaw))")
+
+        // OpenClaw device ID = SHA-256(raw public key), lowercase hex.
+        let deviceId = SHA256.hash(data: publicKeyRaw)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        print("[OpenClaw] DEVICE ID = \(deviceId)")
+
+        // OpenClaw expects the raw public key as base64url without padding.
+        let publicKey = base64URLEncode(publicKeyRaw)
+
+        // Use the configured Gateway token for the signature.
+        let token = authToken
+
+        // Current OpenClaw v3 device-auth payload.
+        let signedPayload = [
+            "v3",
+            deviceId,
+            clientId,
+            clientMode,
+            role,
+            scopes.joined(separator: ","),
+            String(signedAt),
+            token,
+            nonce,
+            platform.lowercased(),
+            deviceFamily.lowercased()
+        ].joined(separator: "|")
+
+        let signatureData = try devicePrivateKey.signature(
+            for: Data(signedPayload.utf8)
+        )
+
+        let signature = base64URLEncode(signatureData)
+
+        let params: [String: Any] = [
+            "minProtocol": 4,
+            "maxProtocol": 4,
+
+            "client": [
+                "id": clientId,
+                "version": "1.0.0",
+                "platform": platform,
+                "mode": clientMode,
+                "deviceFamily": deviceFamily
+            ],
+
+            "role": role,
+            "scopes": scopes,
+            "caps": [],
+            "commands": [],
+            "permissions": [:],
+
+            "auth": [
+                "token": token
+            ],
+
+            "locale": Locale.current.identifier,
+            "userAgent": "OpenVision/iOS",
+
+            "device": [
+                "id": deviceId,
+                "publicKey": publicKey,
+                "signature": signature,
+                "signedAt": signedAt,
+                "nonce": nonce
+            ]
+        ]
+
+        requestCounter += 1
+        let requestId = "connect-\(requestCounter)"
+
+        let request = OpenClawRequest(
+            id: requestId,
+            method: "connect",
+            params: params
+        )
+
+        let data = try JSONEncoder().encode(request)
+
+        guard let webSocket = webSocket else {
+            print("[OpenClaw] Handshake debug: webSocket = nil")
+            throw AIBackendError.notConnected
+        }
+
+        print("[OpenClaw] Handshake debug: WebSocket exists, state=\(webSocket.state.rawValue)")
+        print("[OpenClaw] Sending connect handshake...")
+
+        let response: OpenClawResponse = try await withCheckedThrowingContinuation { continuation in
+            pendingRequests[requestId] = continuation
+
+            webSocket.send(
+                .string(String(decoding: data, as: UTF8.self))
+            ) { [weak self] error in
+
+                if let error {
+                    Task { @MainActor in
+                        if self?.pendingRequests.removeValue(forKey: requestId) != nil {
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+            }
+        }
+
+        guard response.ok else {
+            let code = response.error?.code ?? ""
+            let message = response.error?.message ?? "Handshake rejected"
+            print("[OpenClaw] Connect handshake rejected: \(code) \(message)")
+            if code == "NOT_PAIRED" {
+                // A new device must be approved once on the gateway host.
+                throw AIBackendError.requestFailed(
+                    "Device not approved yet. On the gateway computer run: openclaw devices list, then openclaw devices approve <request id>"
+                )
+            }
+            throw AIBackendError.requestFailed(message)
+        }
+
+        print("[OpenClaw] Connect handshake accepted")
+    }
+
+    /// Encode binary data as unpadded base64url.
+    private func base64URLEncode(_ data: Data) -> String {
+        data
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
 
     /// Handle event from server
-    private func handleEvent(_ event: OpenClawEvent) {
+    private func handleEvent(_ event: OpenClawEvent) async {
         guard let payload = event.payload else {
             print("[OpenClaw] Event without payload: \(event.event)")
             return
@@ -683,7 +854,7 @@ final class OpenClawService: ObservableObject {
                 print("[OpenClaw] Chat state: \(state)")
             }
 
-        case "connect.challenge", "tick", "presence", "health":
+        case "tick", "presence", "health":
             // Ignore these events
             break
 

@@ -821,11 +821,13 @@ final class VoiceAgentViewModel: ObservableObject {
         // Matched on WORDS, not substrings: `.contains("stop")` treated "what's on the desktop"
         // as a stop command and killed the session mid-question.
         let commandWords = Set(lowerCommand.split(whereSeparator: { !$0.isLetter }).map(String.init))
-        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough"]
+        let stopSingleWords: Set<String> = ["stop", "quiet", "silence", "enough",
+                                            "стоп", "хватит", "тише", "замолчи", "помолчи"]
         let stopPhrases = ["be quiet", "shut up", "ok stop", "okay stop", "stop talking", "stop it"]
         let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                              || stopPhrases.contains { lowerCommand.contains($0) })
                              && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
+                             && !lowerCommand.contains("видео")
 
         if isStopCommand {
             // In live video mode, "stop" means SHUT UP, not "tear down my camera session" —
@@ -849,14 +851,17 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Check for live video mode commands
         let startLiveKeywords = ["start video stream", "start live video", "start video", "start streaming",
-                                 "enable video", "live mode", "go live", "video mode"]
+                                 "enable video", "live mode", "go live", "video mode",
+                                 "включи видео", "запусти видео", "начни видео", "видеорежим"]
 
         let isStartLiveCommand = startLiveKeywords.contains { lowerCommand.contains($0) }
         // Fuzzy stop match: any "video"/"stream" phrase with a stop-like word. Tolerates Apple STT
         // dropping the leading 's' ("stop video" → "top video"), which previously sailed past the
         // exact-keyword list and got sent to the model as a question instead of ending the mode.
         let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream")
-        let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off"]
+            || lowerCommand.contains("видео")
+        let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off",
+                         "стоп", "выключи", "останови", "заверши", "закончи"]
         let isStopLiveCommand = mentionsVideo && stopWords.contains { lowerCommand.contains($0) }
 
         // Handle live video mode commands
@@ -938,7 +943,10 @@ final class VoiceAgentViewModel: ObservableObject {
                             "capture a photo", "capture photo", "snap a photo", "snap a picture",
                             "what do you see", "what are you looking at", "look at this",
                             "what's in front of me", "describe what you see", "what is this",
-                            "what am i looking at", "can you see"]
+                            "what am i looking at", "can you see",
+                            "сфотографируй", "сделай фото", "сделай снимок", "что ты видишь",
+                            "что видишь", "перед собой", "передо мной", "перед тобой",
+                            "посмотри на это", "что это такое", "на что я смотрю", "опиши"]
 
         let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
 
@@ -1616,15 +1624,23 @@ final class VoiceAgentViewModel: ObservableObject {
         let triggers = [
             "take a picture of this", "take a photo of this", "take a picture", "take a photo",
             "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
-            "snap a picture", "go ahead and take"
+            "snap a picture", "go ahead and take",
+            "сфотографируй", "сделай фото", "сделай снимок"
         ]
         for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
         s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         // Trim leftover connective prefixes left after removing the trigger ("...and tell me…").
-        for prefix in ["and ", "of this ", "of ", "please "] {
+        for prefix in ["and ", "of this ", "of ", "please ", "и ", "пожалуйста "] {
             while s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
         }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+        // Russian questions get a Russian wrapper so the model answers in Russian.
+        if command.unicodeScalars.contains(where: { (0x0400...0x04FF).contains($0.value) }) {
+            if s.count < 3 {
+                return "Что главное на этом изображении? Назови конкретно и опиши основные видимые детали в 2–3 предложениях. Отвечай по-русски."
+            }
+            return "Внимательно посмотри на изображение и ответь конкретно, по-русски: \(s)"
+        }
         if s.count < 3 {
             return "What is the main object in this image? Name it specifically and describe its key visible details in 2–3 sentences."
         }

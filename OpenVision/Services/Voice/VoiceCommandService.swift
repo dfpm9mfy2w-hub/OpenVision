@@ -84,7 +84,27 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Speech Recognition
 
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    /// Recognition language follows the wake phrase: a Cyrillic phrase ("Привет, Генри") means
+    /// the user speaks Russian, anything else keeps the original English recognizer.
+    var recognitionLocaleID: String {
+        let isCyrillic = wakeWord.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
+        return isCyrillic ? "ru-RU" : "en-US"
+    }
+
+    private var cachedRecognizer: SFSpeechRecognizer?
+    private var cachedRecognizerLocaleID: String?
+
+    /// Rebuilt when the wake phrase switches language; otherwise reused.
+    private var speechRecognizer: SFSpeechRecognizer? {
+        let localeID = recognitionLocaleID
+        if cachedRecognizerLocaleID != localeID {
+            cachedRecognizer = SFSpeechRecognizer(locale: Locale(identifier: localeID))
+            cachedRecognizerLocaleID = localeID
+            print("[VoiceCommand] Speech recognizer locale: \(localeID), available: \(cachedRecognizer?.isAvailable ?? false)")
+        }
+        return cachedRecognizer
+    }
+
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
 
@@ -291,7 +311,9 @@ final class VoiceCommandService: ObservableObject {
     private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
         request.shouldReportPartialResults = true
         request.taskHint = .search
-        var phrases = ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
+        var phrases = recognitionLocaleID == "ru-RU"
+            ? ["Привет, Генри", "Генри"]
+            : ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
         if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
         request.contextualStrings = phrases
     }
@@ -539,11 +561,8 @@ final class VoiceCommandService: ObservableObject {
         case .listening, .conversationMode:
             // Strip wake word from transcription (like xmeta does)
             var command = transcription
-            for ww in [wakeWord.lowercased(), "ok vision", "okay vision", "hey vision", "hi vision"] {
-                if let range = command.lowercased().range(of: ww) {
-                    command = String(command[range.upperBound...]).trimmingCharacters(in: .whitespaces)
-                    break
-                }
+            if let match = findWakeWord(in: transcription) {
+                command = match.remainder
             }
             currentTranscription = command
 
@@ -635,9 +654,65 @@ final class VoiceCommandService: ObservableObject {
     private func isStopPhrase(_ text: String) -> Bool {
         guard detectWakeWord(in: text, bypassCooldown: true) else { return false }
         let lower = text.lowercased()
-        if lower.contains("video") || lower.contains("stream") { return false }
-        let stopWords = ["stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel"]
+        if lower.contains("video") || lower.contains("stream") || lower.contains("видео") { return false }
+        let stopWords = ["stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel",
+                         "стоп", "хватит", "замолчи", "помолчи", "тише", "отмена"]
         return stopWords.contains { lower.contains($0) }
+    }
+
+    /// Built-in English variations and common misrecognitions of "Ok Vision".
+    private static let builtInWakeVariations = [
+        "ok vision", "okay vision", "o.k. vision", "o k vision",
+        "hey vision", "hi vision",
+        "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+    ]
+
+    /// Words of `text`, lowercased, "ё" folded to "е", punctuation dropped — so the recognizer's
+    /// "Привет, Генри!" matches a wake phrase typed as "привет генри". Each word keeps its range in
+    /// the original text so the command after the wake phrase can be cut out verbatim.
+    private static func words(in text: String) -> [(word: String, range: Range<String.Index>)] {
+        var result: [(word: String, range: Range<String.Index>)] = []
+        var start: String.Index?
+        var index = text.startIndex
+        while index < text.endIndex {
+            let char = text[index]
+            if char.isLetter || char.isNumber {
+                if start == nil { start = index }
+            } else if let s = start {
+                result.append((normalizedWord(text[s..<index]), s..<index))
+                start = nil
+            }
+            index = text.index(after: index)
+        }
+        if let s = start {
+            result.append((normalizedWord(text[s..<text.endIndex]), s..<text.endIndex))
+        }
+        return result
+    }
+
+    private static func normalizedWord(_ word: Substring) -> String {
+        word.lowercased().replacingOccurrences(of: "ё", with: "е")
+    }
+
+    /// Earliest wake-phrase match in `text`: how many characters precede it, and the original text
+    /// after it (leading punctuation trimmed). Matching is on whole words, not substrings.
+    private func findWakeWord(in text: String) -> (offset: Int, remainder: String)? {
+        let tokens = Self.words(in: text)
+        let phrases = ([wakeWord] + Self.builtInWakeVariations)
+            .map { Self.words(in: $0).map(\.word) }
+            .filter { !$0.isEmpty }
+
+        for start in tokens.indices {
+            for phrase in phrases where start + phrase.count <= tokens.count {
+                guard tokens[start..<(start + phrase.count)].map(\.word) == phrase else { continue }
+                let offset = text.distance(from: text.startIndex, to: tokens[start].range.lowerBound)
+                let end = tokens[start + phrase.count - 1].range.upperBound
+                let remainder = String(text[end...])
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters))
+                return (offset, remainder)
+            }
+        }
+        return nil
     }
 
     /// True when a wake-word variation sits at (or very near) the START of the transcript — i.e. a
@@ -645,50 +720,17 @@ final class VoiceCommandService: ObservableObject {
     /// transcription can incidentally contain a "…vision…" buried mid-sentence; requiring the wake
     /// word up front rejects those phantoms while still catching a real interrupt.
     private func wakeWordAtStart(_ text: String) -> Bool {
-        let lower = text.lowercased()
-        let variations = [
-            wakeWord.lowercased(),
-            "ok vision", "okay vision", "o.k. vision", "o k vision",
-            "hey vision", "hi vision",
-            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
-        ]
-        for v in variations {
-            if let r = lower.range(of: v) {
-                // Characters of speech before the wake word. A little leeway ("uh, ok vision")
-                // is fine; a whole sentence in front of it means it's echo, not a barge-in.
-                if lower.distance(from: lower.startIndex, to: r.lowerBound) <= 12 { return true }
-            }
-        }
-        return false
+        // Characters of speech before the wake word. A little leeway ("uh, ok vision")
+        // is fine; a whole sentence in front of it means it's echo, not a barge-in.
+        guard let match = findWakeWord(in: text) else { return false }
+        return match.offset <= 12
     }
 
     /// Detect wake word in transcription
     private func detectWakeWord(in text: String, bypassCooldown: Bool = false) -> Bool {
         guard bypassCooldown || !wakeWordCooldownActive else { return false }
 
-        let lowercased = text.lowercased()
-        let wakeWordLower = wakeWord.lowercased()
-
-        // Check for exact match or common variations/misrecognitions
-        let variations = [
-            wakeWordLower,
-            // OK Vision variants (most reliable)
-            "ok vision",
-            "okay vision",
-            "o.k. vision",
-            "o k vision",
-            // Ok Vision variants
-            "hey vision",
-            "hi vision",
-            // Common misrecognitions
-            "a vision",
-            "heavy vision",
-            "have vision",
-            "obey vision",
-            "oak vision"
-        ]
-
-        let detected = variations.contains { lowercased.contains($0) }
+        let detected = findWakeWord(in: text) != nil
         if detected {
             print("[VoiceCommand] Detected wake word in: '\(text)'")
         }
@@ -697,24 +739,7 @@ final class VoiceCommandService: ObservableObject {
 
     /// Extract command text after wake word
     private func extractCommandAfterWakeWord(_ text: String) -> String {
-        let lowercased = text.lowercased()
-        let wakeWordLower = wakeWord.lowercased()
-
-        let variations = [
-            wakeWordLower,
-            "ok vision", "okay vision", "o.k. vision", "o k vision",
-            "hey vision", "hi vision",
-            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
-        ]
-
-        for variation in variations {
-            if let range = lowercased.range(of: variation) {
-                let afterWakeWord = String(text[range.upperBound...])
-                    .trimmingCharacters(in: .whitespaces)
-                return afterWakeWord
-            }
-        }
-        return ""
+        findWakeWord(in: text)?.remainder ?? ""
     }
 
     /// Handle wake word detection
@@ -747,13 +772,8 @@ final class VoiceCommandService: ObservableObject {
     private func handleCommandComplete(_ text: String) {
         // Remove wake word from beginning
         var command = text
-        let wakeWordLower = wakeWord.lowercased()
-
-        for prefix in [wakeWordLower, "hey vision", "ok vision", "okay vision"] {
-            if command.lowercased().hasPrefix(prefix) {
-                command = String(command.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
-                break
-            }
+        if let match = findWakeWord(in: text), match.offset == 0 {
+            command = match.remainder
         }
 
         guard !command.isEmpty else { return }
