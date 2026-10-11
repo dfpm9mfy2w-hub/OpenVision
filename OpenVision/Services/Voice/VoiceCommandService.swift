@@ -84,11 +84,13 @@ final class VoiceCommandService: ObservableObject {
 
     // MARK: - Speech Recognition
 
-    /// Recognition language follows the wake phrase: a Cyrillic phrase ("Привет, Генри") means
-    /// the user speaks Russian, anything else keeps the original English recognizer.
+    /// Russian when the wake phrase is Cyrillic ("Привет, Дубина") or the iPhone's language is
+    /// Russian — so a Russian speaker is understood even if the settings still say "Ok Vision".
+    /// Everyone else keeps the original English recognizer.
     var recognitionLocaleID: String {
         let isCyrillic = wakeWord.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
-        return isCyrillic ? "ru-RU" : "en-US"
+        let deviceIsRussian = Locale.preferredLanguages.first?.hasPrefix("ru") ?? false
+        return isCyrillic || deviceIsRussian ? "ru-RU" : "en-US"
     }
 
     private var cachedRecognizer: SFSpeechRecognizer?
@@ -312,7 +314,7 @@ final class VoiceCommandService: ObservableObject {
         request.shouldReportPartialResults = true
         request.taskHint = .search
         var phrases = recognitionLocaleID == "ru-RU"
-            ? ["Привет, Генри", "Генри"]
+            ? ["Привет, Дубина", "Дубина", "Окей, Вижн"]
             : ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
         if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
         request.contextualStrings = phrases
@@ -397,7 +399,7 @@ final class VoiceCommandService: ObservableObject {
         hasSpokenThisTurn = false
         currentTranscription = ""
 
-        // Start conversation timeout (exits if no speech for 4 seconds)
+        // Start conversation timeout (exits after the configured silence, or never)
         startConversationTimeout()
 
         print("[VoiceCommand] Entered conversation mode")
@@ -504,7 +506,13 @@ final class VoiceCommandService: ObservableObject {
     /// Start conversation timeout (auto-exit after silence)
     private func startConversationTimeout() {
         conversationTimeoutTimer?.invalidate()
-        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
+        conversationTimeoutTimer = nil
+        // Settings → Voice → Auto-End Timeout. "Never" (0) keeps the conversation open until the
+        // user dismisses the assistant ("Дубина, можешь идти"); the recognizer still relaunches
+        // itself about once a minute via restartIfRecognizerEnded.
+        let timeout = SettingsManager.shared.settings.conversationTimeout
+        guard timeout > 0 else { return }
+        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.handleConversationTimeout()
             }
@@ -660,15 +668,18 @@ final class VoiceCommandService: ObservableObject {
         return stopWords.contains { lower.contains($0) }
     }
 
-    /// Built-in English variations and common misrecognitions of "Ok Vision".
+    /// Built-in English variations and common misrecognitions of "Ok Vision", plus the Russian
+    /// wake phrase and how the Russian recognizer spells "Ok Vision" — always accepted, so the
+    /// assistant answers to "Привет, Дубина" whatever the settings field says.
     private static let builtInWakeVariations = [
         "ok vision", "okay vision", "o.k. vision", "o k vision",
         "hey vision", "hi vision",
-        "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+        "a vision", "heavy vision", "have vision", "obey vision", "oak vision",
+        "привет дубина", "окей вижн", "ок вижн", "окей вижен"
     ]
 
     /// Words of `text`, lowercased, "ё" folded to "е", punctuation dropped — so the recognizer's
-    /// "Привет, Генри!" matches a wake phrase typed as "привет генри". Each word keeps its range in
+    /// "Привет, Дубина!" matches a wake phrase typed as "привет дубина". Each word keeps its range in
     /// the original text so the command after the wake phrase can be cut out verbatim.
     private static func words(in text: String) -> [(word: String, range: Range<String.Index>)] {
         var result: [(word: String, range: Range<String.Index>)] = []
@@ -865,6 +876,9 @@ final class VoiceCommandService: ObservableObject {
 
         if !currentTranscription.isEmpty {
             handleCommandComplete(currentTranscription)
+        } else if SettingsManager.shared.settings.conversationTimeout == 0 {
+            // Always-on conversation: an empty wake turn keeps listening instead of going idle.
+            enterConversationMode()
         } else {
             state = .idle
             currentTranscription = ""

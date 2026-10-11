@@ -137,17 +137,178 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
+        if useOpenAIVoice {
+            pendingUtterances += 1
+            openAIQueue.append(text)
+            startOpenAIPumpIfNeeded()
+            return
+        }
+        speakWithSystemVoice(text)
+    }
+
+    /// Apple system voice. `alreadyCounted` is true for an OpenAI fallback, whose sentence was
+    /// already counted in `pendingUtterances` when it was queued.
+    private func speakWithSystemVoice(_ text: String, alreadyCounted: Bool = false) {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = voice(for: text)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
-        pendingUtterances += 1
+        if !alreadyCounted { pendingUtterances += 1 }
         synthesizer.speak(utterance)
+    }
+
+    // MARK: - OpenAI voice (cloud)
+    //
+    // Same contract as the system voice — `isSpeaking`, `pendingUtterances`, `onSpeechStarted`/
+    // `onSpeechEnded` — so barge-in pausing and streaming replies work unchanged. Sentences are
+    // synthesized in order; the next one is fetched while the current one plays to hide latency.
+
+    private var openAIQueue: [String] = []
+    private var openAIPump: Task<Void, Never>?
+    private var openAIPlayer: AVAudioPlayer?
+    private var openAIPlaybackDone: CheckedContinuation<Void, Never>?
+    /// Bumped by `stop()`; a pump from an older generation exits without touching state.
+    private var openAIGeneration = 0
+
+    private var useOpenAIVoice: Bool {
+        let settings = SettingsManager.shared.settings
+        return settings.ttsEngine == .openAI && !settings.openAIAPIKey.isEmpty
+    }
+
+    private func startOpenAIPumpIfNeeded() {
+        guard openAIPump == nil else { return }
+        let generation = openAIGeneration
+        openAIPump = Task { [weak self] in
+            await self?.runOpenAIPump(generation: generation)
+        }
+    }
+
+    private func runOpenAIPump(generation: Int) async {
+        var prefetched: (text: String, audio: Task<Data?, Never>)?
+        while generation == openAIGeneration {
+            let current: (text: String, audio: Task<Data?, Never>)
+            if let next = prefetched {
+                current = next
+                prefetched = nil
+            } else if !openAIQueue.isEmpty {
+                let text = openAIQueue.removeFirst()
+                current = (text, fetchOpenAISpeech(text))
+            } else {
+                break
+            }
+
+            let audio = await current.audio.value
+            guard generation == openAIGeneration else { break }
+
+            if !openAIQueue.isEmpty {
+                let text = openAIQueue.removeFirst()
+                prefetched = (text, fetchOpenAISpeech(text))
+            }
+
+            if let audio, await playOpenAIAudio(audio, generation: generation) {
+                guard generation == openAIGeneration else { break }
+                finishOneUtterance()
+            } else {
+                guard generation == openAIGeneration else { break }
+                // Network/API failure: say it with the system voice rather than drop it. The
+                // synthesizer delegate settles this sentence's count when it finishes.
+                print("[TTS] OpenAI voice unavailable — falling back to system voice")
+                speakWithSystemVoice(current.text, alreadyCounted: true)
+                while synthesizer.isSpeaking && generation == openAIGeneration {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+            }
+        }
+        prefetched?.audio.cancel()
+        if generation == openAIGeneration { openAIPump = nil }
+    }
+
+    /// One OpenAI sentence finished playing — same bookkeeping as the synthesizer's didFinish.
+    private func finishOneUtterance() {
+        pendingUtterances = max(0, pendingUtterances - 1)
+        if pendingUtterances == 0 && !streamingActive {
+            isSpeaking = false
+            onSpeechEnded?()
+        }
+    }
+
+    private func fetchOpenAISpeech(_ text: String) -> Task<Data?, Never> {
+        let settings = SettingsManager.shared.settings
+        let base = settings.openAIBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        let key = settings.openAIAPIKey
+        let body: [String: Any] = [
+            "model": settings.openAITTSModel,
+            "voice": settings.openAITTSVoice,
+            "input": text,
+            "instructions": settings.openAITTSInstructions,
+            "response_format": "mp3"
+        ]
+        let payload = try? JSONSerialization.data(withJSONObject: body)
+        return Task.detached {
+            guard let url = URL(string: base + "/audio/speech"), let payload else { return nil }
+            var request = URLRequest(url: url, timeoutInterval: 20)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = payload
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard status == 200 else {
+                    // Log only the error code — the message can echo part of the API key.
+                    let error = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? [String: Any]
+                    print("[TTS] OpenAI speech HTTP \(status), code: \(error?["code"] as? String ?? error?["type"] as? String ?? "unknown")")
+                    return nil
+                }
+                return data
+            } catch {
+                if !Task.isCancelled { print("[TTS] OpenAI speech request failed: \(error.localizedDescription)") }
+                return nil
+            }
+        }
+    }
+
+    /// Play one synthesized sentence; returns false if the audio couldn't be played.
+    private func playOpenAIAudio(_ data: Data, generation: Int) async -> Bool {
+        guard let player = try? AVAudioPlayer(data: data) else { return false }
+        player.delegate = self
+        openAIPlayer = player
+        guard player.play() else {
+            openAIPlayer = nil
+            return false
+        }
+        MetricsCollector.shared.markFirstAudio()
+        if !isSpeaking {
+            isSpeaking = true
+            onSpeechStarted?()
+        }
+        await withCheckedContinuation { continuation in
+            if generation == openAIGeneration && player.isPlaying {
+                openAIPlaybackDone = continuation
+            } else {
+                continuation.resume()
+            }
+        }
+        openAIPlayer = nil
+        return true
+    }
+
+    private func resumeOpenAIPlaybackWaiter() {
+        openAIPlaybackDone?.resume()
+        openAIPlaybackDone = nil
     }
 
     /// Stop speaking and clear the queue.
     func stop() {
+        openAIGeneration += 1
+        openAIQueue.removeAll()
+        openAIPump?.cancel()
+        openAIPump = nil
+        openAIPlayer?.stop()
+        openAIPlayer = nil
+        resumeOpenAIPlaybackWaiter()
+
         synthesizer.stopSpeaking(at: .immediate)
         streamingActive = false
         pendingUtterances = 0
@@ -156,12 +317,33 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Pause speaking
     func pause() {
+        openAIPlayer?.pause()
         synthesizer.pauseSpeaking(at: .word)
     }
 
     /// Continue speaking
     func continueSpeaking() {
+        openAIPlayer?.play()
         synthesizer.continueSpeaking()
+    }
+}
+
+// MARK: - AVAudioPlayerDelegate (OpenAI voice)
+
+extension TTSService: AVAudioPlayerDelegate {
+    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        Task { @MainActor in
+            guard player === self.openAIPlayer else { return }
+            self.resumeOpenAIPlaybackWaiter()
+        }
+    }
+
+    nonisolated func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        Task { @MainActor in
+            print("[TTS] OpenAI audio decode error: \(error?.localizedDescription ?? "unknown")")
+            guard player === self.openAIPlayer else { return }
+            self.resumeOpenAIPlaybackWaiter()
+        }
     }
 }
 

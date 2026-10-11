@@ -58,6 +58,17 @@ final class GlassesManager: ObservableObject {
     private var photoDataListenerToken: (any AnyListenerToken)?
     private var errorListenerToken: (any AnyListenerToken)?
 
+    /// Frames received since the stream started (diagnostics only).
+    private var receivedFrameCount = 0
+
+    /// A few recent frames, ~0.7 s apart, so a question can carry what just happened — not a
+    /// single still. Cleared when the stream stops.
+    private var recentFrames: [(time: Date, image: UIImage)] = []
+
+    /// In-flight stream start. The camera is warmed at session start and a vision question can
+    /// arrive before that finishes; both must await the same start, not open two sessions.
+    private var startStreamingTask: Task<Void, Never>?
+
     // MARK: - Callbacks
 
     /// Called when a video frame is received
@@ -123,8 +134,27 @@ final class GlassesManager: ObservableObject {
 
     // MARK: - Streaming
 
-    /// Start camera streaming from glasses
+    /// Start camera streaming from glasses (concurrent callers share one start).
     func startStreaming() async {
+        if let inFlight = startStreamingTask {
+            await inFlight.value
+            return
+        }
+        let task = Task { await performStartStreaming() }
+        startStreamingTask = task
+        await task.value
+        startStreamingTask = nil
+    }
+
+    /// Up to `maxCount` frames captured before `cutoff` (and no older than `seconds`), oldest first.
+    func framesBefore(_ cutoff: Date, maxCount: Int, within seconds: TimeInterval) -> [UIImage] {
+        recentFrames
+            .filter { $0.time < cutoff && cutoff.timeIntervalSince($0.time) <= seconds }
+            .suffix(maxCount)
+            .map(\.image)
+    }
+
+    private func performStartStreaming() async {
         guard isRegistered else {
             errorMessage = "Not registered with Meta AI"
             print("[GlassesManager] Cannot start streaming - not registered")
@@ -245,6 +275,7 @@ final class GlassesManager: ObservableObject {
             }
             camera = cam
 
+            receivedFrameCount = 0
             setupStreamListeners(stream: cam.stream)
             cam.stream.start()
             isStreaming = true
@@ -273,6 +304,7 @@ final class GlassesManager: ObservableObject {
         isStreaming = false
         lastFrame = nil
         lastFrameTime = .distantPast
+        recentFrames.removeAll()
 
         print("[GlassesManager] Streaming stopped")
     }
@@ -328,6 +360,7 @@ final class GlassesManager: ObservableObject {
         // State listener
         stateListenerToken = stream.statePublisher.listen { [weak self] state in
             Task { @MainActor in
+                print("[GlassesManager] Stream state: \(state)")
                 switch state {
                 case .streaming:
                     self?.isStreaming = true
@@ -345,9 +378,21 @@ final class GlassesManager: ObservableObject {
                 // Hand the raw sample buffer to the recorder (if any). SessionRecorder immediately
                 // hops it onto its own writer queue, so this stays cheap even at 30fps.
                 self?.onVideoSampleBuffer?(frame.sampleBuffer)
+                // A stream can report "streaming" yet deliver nothing — log the first frames so
+                // "no photo" can be told apart from "frames arrive but don't decode".
+                if let self {
+                    self.receivedFrameCount += 1
+                    if self.receivedFrameCount <= 3 || self.receivedFrameCount % 150 == 0 {
+                        print("[GlassesManager] Frame #\(self.receivedFrameCount) received, decodable: \(frame.makeUIImage() != nil)")
+                    }
+                }
                 if let image = frame.makeUIImage() {
                     self?.lastFrame = image
                     self?.lastFrameTime = Date()
+                    if let self, Date().timeIntervalSince(self.recentFrames.last?.time ?? .distantPast) >= 0.7 {
+                        self.recentFrames.append((Date(), image))
+                        if self.recentFrames.count > 4 { self.recentFrames.removeFirst() }
+                    }
                     self?.onVideoFrame?(image)
                 }
             }
@@ -381,7 +426,7 @@ final class GlassesManager: ObservableObject {
     /// TEMP DIAGNOSTIC (issue #55 follow-up): the DAT SDK logs its teardown reasons via OSLog,
     /// which `devicectl --console` can't see. The app CAN read its own process's entries, so on
     /// session failure dump every non-Apple subsystem line from the last `seconds` to stdout.
-    private func dumpSDKLogs(since seconds: TimeInterval) {
+    func dumpSDKLogs(since seconds: TimeInterval) {
         do {
             let store = try OSLogStore(scope: .currentProcessIdentifier)
             let position = store.position(date: Date().addingTimeInterval(-seconds))

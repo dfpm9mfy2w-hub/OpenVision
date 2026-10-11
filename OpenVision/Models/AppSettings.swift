@@ -51,11 +51,13 @@ enum AIBackendType: String, Codable, CaseIterable {
 enum TTSEngineType: String, Codable, CaseIterable, Identifiable {
     case appleSystem = "apple"
     case kokoro = "kokoro"
+    case openAI = "openai"
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .appleSystem: return "Apple (system voice)"
         case .kokoro: return "Kokoro (natural, on-device)"
+        case .openAI: return "OpenAI (natural, cloud)"
         }
     }
 }
@@ -137,6 +139,15 @@ struct AppSettings: Codable, Equatable {
 
     /// Selected Kokoro voice (e.g. "af_heart"). First letter: a = American, b = British.
     var kokoroVoice: String = "af_heart"
+
+    /// OpenAI speech voice (gpt-4o-mini-tts). Uses the OpenAI key/base URL above.
+    var openAITTSVoice: String = "onyx"
+
+    /// OpenAI speech model.
+    var openAITTSModel: String = "gpt-4o-mini-tts"
+
+    /// How the OpenAI voice should sound — gpt-4o-mini-tts follows these delivery instructions.
+    var openAITTSInstructions: String = "Говори как невозмутимый, интеллигентный ИИ-дворецкий: спокойно, размеренно, вежливо, с лёгкой суховатой иронией. Чёткая дикция, низкий бархатный тембр, без излишних эмоций."
 
     // MARK: - Telemetry (opt-in, self-hosted)
 

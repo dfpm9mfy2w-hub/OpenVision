@@ -364,11 +364,34 @@ final class OpenClawService: ObservableObject {
 
     // MARK: - Send Message
 
-    /// Session key for conversation continuity
-    private static var sessionKey = "openvision-\(UUID().uuidString.prefix(8))"
+    /// Session key for conversation continuity. Persisted so the conversation (and what the
+    /// assistant learned in it) survives app restarts; a fresh key per launch made every launch a
+    /// stranger. `startNewConversation()` rotates it on request.
+    private static let sessionKeyDefaultsKey = "OpenClaw.sessionKey"
+
+    private static var sessionKey: String {
+        if let saved = UserDefaults.standard.string(forKey: sessionKeyDefaultsKey) {
+            return saved
+        }
+        let key = "openvision-\(UUID().uuidString.prefix(8))"
+        UserDefaults.standard.set(key, forKey: sessionKeyDefaultsKey)
+        return key
+    }
+
+    /// Forget the current conversation: the next message opens a new OpenClaw session.
+    func startNewConversation() {
+        UserDefaults.standard.removeObject(forKey: Self.sessionKeyDefaultsKey)
+        print("[OpenClaw] New conversation — session key rotated")
+    }
 
     /// Send a text message to the AI agent
     func sendMessage(_ text: String, imageData: Data? = nil) async throws {
+        try await sendMessage(text, images: imageData.map { [$0] } ?? [])
+    }
+
+    /// Send a message with several JPEG frames (oldest first) — lets the agent see what changed
+    /// over the last seconds instead of a single still.
+    func sendMessage(_ text: String, images: [Data]) async throws {
         guard connectionState.isUsable else {
             throw AIBackendError.notConnected
         }
@@ -383,14 +406,15 @@ final class OpenClawService: ObservableObject {
             "idempotencyKey": UUID().uuidString
         ]
 
-        // Add image as attachment if provided
-        if let imageData = imageData {
-            let attachment: [String: Any] = [
-                "type": "image",
-                "mimeType": "image/jpeg",
-                "content": imageData.base64EncodedString()
-            ]
-            params["attachments"] = [attachment]
+        // Add images as attachments if provided
+        if !images.isEmpty {
+            params["attachments"] = images.map { imageData -> [String: Any] in
+                [
+                    "type": "image",
+                    "mimeType": "image/jpeg",
+                    "content": imageData.base64EncodedString()
+                ]
+            }
         }
 
         print("[OpenClaw] Sending message: \(text.prefix(50))...")

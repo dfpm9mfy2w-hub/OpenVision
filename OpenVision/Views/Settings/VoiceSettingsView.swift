@@ -42,6 +42,10 @@ struct VoiceSettingsView: View {
                         TextField("Ok Vision", text: $settingsManager.settings.wakeWord)
                             .autocorrectionDisabled()
                     }
+
+                    // Which language the recognizer listens in (follows the phrase / iPhone language).
+                    LabeledContent("Recognition language",
+                                   value: VoiceCommandService.shared.recognitionLocaleID == "ru-RU" ? "Русский" : "English")
                 }
             } header: {
                 Text("Wake Word")
@@ -81,7 +85,7 @@ struct VoiceSettingsView: View {
             } header: {
                 Text("Conversation")
             } footer: {
-                Text("Automatically end the conversation after this period of silence.")
+                Text("Automatically end the conversation after this period of silence. With Never, the assistant stays until you dismiss it (\"Дубина, можешь идти\", \"Пока, Дубина\").")
             }
 
             // TTS Voice Section
@@ -102,6 +106,25 @@ struct VoiceSettingsView: View {
                             Text(selectedVoiceName).foregroundColor(.secondary)
                         }
                     }
+                } else if settingsManager.settings.ttsEngine == .openAI {
+                    Picker("OpenAI Voice", selection: $settingsManager.settings.openAITTSVoice) {
+                        ForEach(Self.openAIVoices, id: \.self) { voice in
+                            Text(voice).tag(voice)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Speaking Style")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        TextField("How the voice should sound", text: $settingsManager.settings.openAITTSInstructions, axis: .vertical)
+                            .lineLimit(2...5)
+                    }
+                    Button {
+                        TTSService.shared.speak("Добрый день, сэр. Дубина к вашим услугам.")
+                    } label: {
+                        Label("Test Voice", systemImage: "play.circle")
+                    }
+                    .disabled(settingsManager.settings.openAIAPIKey.isEmpty)
                 } else {
                     Picker("Kokoro Voice", selection: $settingsManager.settings.kokoroVoice) {
                         ForEach(KokoroTTSService.voices, id: \.self) { voice in
@@ -123,7 +146,11 @@ struct VoiceSettingsView: View {
             } header: {
                 Text("Output Voice")
             } footer: {
-                if settingsManager.settings.ttsEngine == .kokoro {
+                if settingsManager.settings.ttsEngine == .openAI {
+                    Text(settingsManager.settings.openAIAPIKey.isEmpty
+                         ? "Add an OpenAI API key under AI Backend → OpenAI first. Until then the system voice is used."
+                         : "Natural cloud voice (gpt-4o-mini-tts) using your OpenAI key. Needs internet; if it fails, the system voice takes over.")
+                } else if settingsManager.settings.ttsEngine == .kokoro {
                     Text("Kokoro is a natural, on-device neural voice — private and offline. Download its model (~600 MB) under Kokoro Model, then it runs entirely on-device.")
                 } else {
                     Text("Apple's built-in system voice. For higher quality, download a Premium/Enhanced voice in iOS Settings → Accessibility → Spoken Content.")
@@ -171,6 +198,10 @@ struct VoiceSettingsView: View {
         .navigationTitle("Voice Control")
         .navigationBarTitleDisplayMode(.inline)
     }
+
+    /// Voices offered by gpt-4o-mini-tts.
+    private static let openAIVoices = ["onyx", "ash", "echo", "fable", "cedar", "verse", "ballad",
+                                       "alloy", "sage", "coral", "marin", "nova", "shimmer"]
 
     // MARK: - Sample Phrases
 
