@@ -10,6 +10,7 @@ enum AIBackendType: String, Codable, CaseIterable {
     case openAI = "openai"
     case appleFoundation = "apple_foundation"
     case localGemma = "local_gemma"
+    case yandex = "yandex"
 
     var displayName: String {
         switch self {
@@ -18,6 +19,7 @@ enum AIBackendType: String, Codable, CaseIterable {
         case .openAI: return "OpenAI"
         case .appleFoundation: return "Apple Intelligence"
         case .localGemma: return "Local (MLX)"
+        case .yandex: return "Яндекс Облако"
         }
     }
 
@@ -33,6 +35,8 @@ enum AIBackendType: String, Codable, CaseIterable {
             return "On-device Apple model — private, no download (iOS 26+)"
         case .localGemma:
             return "On-device Gemma 4 — private, offline, no API cost"
+        case .yandex:
+            return "Alice AI + фото + поиск + голос SpeechKit — работает в России, один счёт"
         }
     }
 
@@ -43,6 +47,7 @@ enum AIBackendType: String, Codable, CaseIterable {
         case .openAI: return "sparkles"
         case .appleFoundation: return "apple.logo"
         case .localGemma: return "cpu"
+        case .yandex: return "cloud"
         }
     }
 }
@@ -52,12 +57,14 @@ enum TTSEngineType: String, Codable, CaseIterable, Identifiable {
     case appleSystem = "apple"
     case kokoro = "kokoro"
     case openAI = "openai"
+    case yandex = "yandex"
     var id: String { rawValue }
     var displayName: String {
         switch self {
         case .appleSystem: return "Apple (system voice)"
         case .kokoro: return "Kokoro (natural, on-device)"
         case .openAI: return "OpenAI (natural, cloud)"
+        case .yandex: return "Яндекс SpeechKit"
         }
     }
 }
@@ -89,6 +96,25 @@ struct AppSettings: Codable, Equatable {
 
     /// Chat model id. gpt-4o-mini is cheap and supports vision — a good default for testing.
     var openAIModel: String = "gpt-4o-mini"
+
+    // MARK: - Yandex Cloud (AI Studio + SpeechKit)
+
+    /// Yandex Cloud API key (service account). Stored in the Keychain, never in settings.json.
+    var yandexAPIKey: String = ""
+
+    /// Yandex Cloud folder ID ("ID каталога") the models are billed to.
+    var yandexFolderID: String = ""
+
+    /// Conversation model (AI Studio common instance).
+    var yandexTextModel: String = "aliceai-llm"
+
+    /// Model used when photos are attached — the image-capable one.
+    var yandexVisionModel: String = "qwen3.6-35b-a3b"
+
+    /// SpeechKit voice and role. Male voices available over the REST API: ermil, filipp, zahar, madi_ru.
+    var yandexVoice: String = "ermil"
+    var yandexVoiceRole: String = "neutral"
+    var yandexVoiceSpeed: Double = 1.0
 
     /// Who the assistant is in the direct OpenAI mode — name, manner, how it addresses the user.
     /// Custom Instructions are appended after it.
@@ -206,6 +232,11 @@ struct AppSettings: Codable, Equatable {
         !geminiAPIKey.isEmpty
     }
 
+    /// Whether Yandex Cloud is configured (key + folder)
+    var isYandexConfigured: Bool {
+        !yandexAPIKey.isEmpty && !yandexFolderID.isEmpty
+    }
+
     /// Whether OpenAI is configured (has API key)
     var isOpenAIConfigured: Bool {
         !openAIAPIKey.isEmpty && !openAIBaseURL.isEmpty
@@ -224,6 +255,7 @@ struct AppSettings: Codable, Equatable {
         case .openAI: return isOpenAIConfigured
         case .appleFoundation: return true   // OS-managed; availability checked at connect
         case .localGemma: return isLocalGemmaConfigured
+        case .yandex: return isYandexConfigured
         }
     }
 

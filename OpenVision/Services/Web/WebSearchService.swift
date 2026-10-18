@@ -26,6 +26,10 @@ enum WebSearchService {
         if let openAI = await openAIWebSearch(trimmed), !openAI.isEmpty {
             return openAI
         }
+        //    Same idea for Yandex Cloud: its own web search on the same Yandex bill.
+        if let yandex = await yandexWebSearch(trimmed), !yandex.isEmpty {
+            return yandex
+        }
         // 3) DuckDuckGo Instant Answer — clean facts / definitions / math (no key).
         if let instant = await instantAnswer(trimmed), !instant.isEmpty {
             return instant
@@ -45,7 +49,8 @@ enum WebSearchService {
                     settings.openAIBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")),
                     settings.openAIModel)
         }
-        guard !key.isEmpty,
+        let backend = await MainActor.run { SettingsManager.shared.settings.aiBackend }
+        guard backend != .yandex, !key.isEmpty,
               URL(string: base)?.host?.hasSuffix("openai.com") == true,
               let url = URL(string: base + "/responses") else { return nil }
 
@@ -73,14 +78,64 @@ enum WebSearchService {
                 print("[WebSearch] OpenAI web search HTTP \(status)")
                 return nil
             }
-            if let text = obj["output_text"] as? String, !text.isEmpty { return text }
-            let texts = (obj["output"] as? [[String: Any]] ?? [])
-                .flatMap { $0["content"] as? [[String: Any]] ?? [] }
-                .compactMap { $0["type"] as? String == "output_text" ? $0["text"] as? String : nil }
-            let joined = texts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            return joined.isEmpty ? nil : joined
+            return responsesText(obj)
         }
         return nil
+    }
+
+    // MARK: - Yandex Cloud web search (AI Studio Responses API)
+
+    /// Yandex's built-in web search, used when Yandex Cloud is the selected backend. Returns nil
+    /// on any failure so the free fallbacks still run.
+    private static func yandexWebSearch(_ query: String) async -> String? {
+        let setup: (headers: [String: String], models: [String])? = await MainActor.run {
+            let settings = SettingsManager.shared.settings
+            guard settings.aiBackend == .yandex, settings.isYandexConfigured else { return nil }
+            return (YandexCloud.headers(settings),
+                    [YandexCloud.modelURI(settings.yandexTextModel, settings),
+                     YandexCloud.modelURI("yandexgpt-5.1", settings)])
+        }
+        guard let setup, let url = URL(string: YandexCloud.baseURL + "/responses") else { return nil }
+
+        // Try the configured model, then YandexGPT (the model used in Yandex's web search docs).
+        for model in setup.models {
+            for toolType in ["web_search", "web_search_preview"] {
+                let body: [String: Any] = [
+                    "model": model,
+                    "tools": [["type": toolType]],
+                    "input": "Найди в интернете актуальные факты по запросу: \(query)\nОтветь кратко, с конкретными числами, датами и местами.",
+                    "max_output_tokens": 1000
+                ]
+                guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                for (header, value) in setup.headers { request.setValue(value, forHTTPHeaderField: header) }
+                request.httpBody = payload
+                request.timeoutInterval = 30
+
+                guard let (data, response) = try? await URLSession.shared.data(for: request),
+                      let status = (response as? HTTPURLResponse)?.statusCode else { return nil }
+                if status == 400 || status == 404 { continue }   // tool type or model not accepted
+                guard status == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    print("[WebSearch] Yandex web search HTTP \(status)")
+                    return nil
+                }
+                return responsesText(obj)
+            }
+        }
+        return nil
+    }
+
+    /// Answer text from a Responses API reply (`output_text`, or the output message parts).
+    private static func responsesText(_ obj: [String: Any]) -> String? {
+        if let text = obj["output_text"] as? String, !text.isEmpty { return text }
+        let texts = (obj["output"] as? [[String: Any]] ?? [])
+            .flatMap { $0["content"] as? [[String: Any]] ?? [] }
+            .compactMap { $0["type"] as? String == "output_text" ? $0["text"] as? String : nil }
+        let joined = texts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
     }
 
     // MARK: - Tavily (primary when a key is set)

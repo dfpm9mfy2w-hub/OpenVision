@@ -137,7 +137,7 @@ final class TTSService: NSObject, ObservableObject {
 
     /// Build an utterance with the selected voice and hand it to the synthesizer's queue.
     private func enqueue(_ text: String) {
-        if useOpenAIVoice {
+        if useCloudVoice {
             pendingUtterances += 1
             openAIQueue.append(text)
             startOpenAIPumpIfNeeded()
@@ -158,7 +158,7 @@ final class TTSService: NSObject, ObservableObject {
         synthesizer.speak(utterance)
     }
 
-    // MARK: - OpenAI voice (cloud)
+    // MARK: - Cloud voice (OpenAI or Yandex SpeechKit)
     //
     // Same contract as the system voice — `isSpeaking`, `pendingUtterances`, `onSpeechStarted`/
     // `onSpeechEnded` — so barge-in pausing and streaming replies work unchanged. Sentences are
@@ -171,9 +171,63 @@ final class TTSService: NSObject, ObservableObject {
     /// Bumped by `stop()`; a pump from an older generation exits without touching state.
     private var openAIGeneration = 0
 
-    private var useOpenAIVoice: Bool {
+    /// A cloud voice is selected and has credentials (OpenAI key, or Yandex key + folder).
+    private var useCloudVoice: Bool {
         let settings = SettingsManager.shared.settings
-        return settings.ttsEngine == .openAI && !settings.openAIAPIKey.isEmpty
+        switch settings.ttsEngine {
+        case .openAI: return !settings.openAIAPIKey.isEmpty
+        case .yandex: return settings.isYandexConfigured
+        default: return false
+        }
+    }
+
+    /// Synthesize one sentence with the selected cloud voice.
+    private func fetchCloudSpeech(_ text: String) -> Task<Data?, Never> {
+        SettingsManager.shared.settings.ttsEngine == .yandex ? fetchYandexSpeech(text) : fetchOpenAISpeech(text)
+    }
+
+    /// Yandex SpeechKit (REST API v1): a form POST that returns the MP3 bytes directly.
+    private func fetchYandexSpeech(_ text: String) -> Task<Data?, Never> {
+        let settings = SettingsManager.shared.settings
+        var fields: [(String, String)] = [
+            ("text", text),
+            ("lang", "ru-RU"),
+            ("voice", settings.yandexVoice),
+            ("speed", String(format: "%.1f", settings.yandexVoiceSpeed)),
+            ("format", "mp3"),
+            ("folderId", settings.yandexFolderID.trimmingCharacters(in: .whitespacesAndNewlines))
+        ]
+        // Only some voices have roles; sending one to a voice without roles is an error.
+        if ["ermil", "zahar", "jane", "omazh", "marina"].contains(settings.yandexVoice), !settings.yandexVoiceRole.isEmpty {
+            fields.append(("emotion", settings.yandexVoiceRole))
+        }
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        let body = fields
+            .map { "\($0.0)=\($0.1.addingPercentEncoding(withAllowedCharacters: allowed) ?? "")" }
+            .joined(separator: "&")
+        let key = settings.yandexAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Task.detached {
+            guard let url = URL(string: YandexCloud.ttsURL) else { return nil }
+            var request = URLRequest(url: url, timeoutInterval: 20)
+            request.httpMethod = "POST"
+            request.setValue("Api-Key \(key)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            request.setValue("false", forHTTPHeaderField: "x-data-logging-enabled")
+            request.httpBody = Data(body.utf8)
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard status == 200 else {
+                    print("[TTS] Yandex SpeechKit HTTP \(status)")
+                    return nil
+                }
+                return data
+            } catch {
+                if !Task.isCancelled { print("[TTS] Yandex SpeechKit request failed: \(error.localizedDescription)") }
+                return nil
+            }
+        }
     }
 
     private func startOpenAIPumpIfNeeded() {
@@ -193,7 +247,7 @@ final class TTSService: NSObject, ObservableObject {
                 prefetched = nil
             } else if !openAIQueue.isEmpty {
                 let text = openAIQueue.removeFirst()
-                current = (text, fetchOpenAISpeech(text))
+                current = (text, fetchCloudSpeech(text))
             } else {
                 break
             }
@@ -203,7 +257,7 @@ final class TTSService: NSObject, ObservableObject {
 
             if !openAIQueue.isEmpty {
                 let text = openAIQueue.removeFirst()
-                prefetched = (text, fetchOpenAISpeech(text))
+                prefetched = (text, fetchCloudSpeech(text))
             }
 
             if let audio, await playOpenAIAudio(audio, generation: generation) {
@@ -213,7 +267,7 @@ final class TTSService: NSObject, ObservableObject {
                 guard generation == openAIGeneration else { break }
                 // Network/API failure: say it with the system voice rather than drop it. The
                 // synthesizer delegate settles this sentence's count when it finishes.
-                print("[TTS] OpenAI voice unavailable — falling back to system voice")
+                print("[TTS] cloud voice unavailable — falling back to system voice")
                 speakWithSystemVoice(current.text, alreadyCounted: true)
                 while synthesizer.isSpeaking && generation == openAIGeneration {
                     try? await Task.sleep(nanoseconds: 100_000_000)
@@ -328,7 +382,7 @@ final class TTSService: NSObject, ObservableObject {
     }
 }
 
-// MARK: - AVAudioPlayerDelegate (OpenAI voice)
+// MARK: - AVAudioPlayerDelegate (cloud voice)
 
 extension TTSService: AVAudioPlayerDelegate {
     nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {

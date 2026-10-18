@@ -48,11 +48,15 @@ enum AIBackendRegistry {
         case .openAI: return OpenAIService.shared
         case .appleFoundation: return AppleFoundationService.shared
         case .localGemma: return GemmaLocalService.shared
+        case .yandex: return OpenAIService.shared   // same Chat Completions client, Yandex endpoint
         }
     }
 
     /// Every backend, for bulk wiring (e.g. attaching the shared reply/state callbacks once).
-    static var all: [AIBackend] { AIBackendType.allCases.map(backend(for:)) }
+    /// Each service once (Yandex shares the OpenAI client).
+    static var all: [AIBackend] {
+        AIBackendType.allCases.filter { $0 != .yandex }.map(backend(for:))
+    }
 }
 
 /// Connection state for AI backends

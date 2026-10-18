@@ -106,6 +106,30 @@ struct VoiceSettingsView: View {
                             Text(selectedVoiceName).foregroundColor(.secondary)
                         }
                     }
+                } else if settingsManager.settings.ttsEngine == .yandex {
+                    Picker("Голос Яндекса", selection: $settingsManager.settings.yandexVoice) {
+                        Text("Ермил").tag("ermil")
+                        Text("Филипп").tag("filipp")
+                        Text("Захар").tag("zahar")
+                        Text("Мади").tag("madi_ru")
+                    }
+                    if ["ermil", "zahar"].contains(settingsManager.settings.yandexVoice) {
+                        Picker("Интонация", selection: $settingsManager.settings.yandexVoiceRole) {
+                            Text("Нейтральная").tag("neutral")
+                            Text("Доброжелательная").tag("good")
+                        }
+                    }
+                    Picker("Скорость", selection: $settingsManager.settings.yandexVoiceSpeed) {
+                        Text("Медленнее").tag(0.9)
+                        Text("Обычная").tag(1.0)
+                        Text("Быстрее").tag(1.1)
+                    }
+                    Button {
+                        TTSService.shared.speak("Добрый день, сэр. Дубина к вашим услугам.")
+                    } label: {
+                        Label("Проверить голос", systemImage: "play.circle")
+                    }
+                    .disabled(!settingsManager.settings.isYandexConfigured)
                 } else if settingsManager.settings.ttsEngine == .openAI {
                     Picker("OpenAI Voice", selection: $settingsManager.settings.openAITTSVoice) {
                         ForEach(Self.openAIVoices, id: \.self) { voice in
@@ -146,7 +170,11 @@ struct VoiceSettingsView: View {
             } header: {
                 Text("Output Voice")
             } footer: {
-                if settingsManager.settings.ttsEngine == .openAI {
+                if settingsManager.settings.ttsEngine == .yandex {
+                    Text(settingsManager.settings.isYandexConfigured
+                         ? "Естественный русский голос Яндекс SpeechKit. Нужен интернет; при сбое включится системный голос."
+                         : "Сначала укажите ключ и ID каталога в AI Backend → Яндекс Облако. Пока используется системный голос.")
+                } else if settingsManager.settings.ttsEngine == .openAI {
                     Text(settingsManager.settings.openAIAPIKey.isEmpty
                          ? "Add an OpenAI API key under AI Backend → OpenAI first. Until then the system voice is used."
                          : "Natural cloud voice (gpt-4o-mini-tts) using your OpenAI key. Needs internet; if it fails, the system voice takes over.")

@@ -61,6 +61,7 @@ final class SettingsManager: ObservableObject {
     /// settings.json as empty strings — the JSON file is plain text and goes into backups.
     private static let secretFields: [(account: String, keyPath: WritableKeyPath<AppSettings, String>)] = [
         ("openAIAPIKey", \.openAIAPIKey),
+        ("yandexAPIKey", \.yandexAPIKey),
         ("openClawAuthToken", \.openClawAuthToken),
         ("geminiAPIKey", \.geminiAPIKey),
         ("tavilyAPIKey", \.tavilyAPIKey),

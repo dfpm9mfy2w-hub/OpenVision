@@ -24,10 +24,47 @@ final class OpenAIService: ObservableObject {
 
     private init() {}
 
-    /// Lightweight "connect": OpenAI is stateless HTTP, so just validate config.
+    /// Lightweight "connect": stateless HTTP, so just validate config.
     func connect() async throws {
-        guard settings.isOpenAIConfigured else { throw OpenAIError.notConfigured }
+        _ = try endpoint()
         isConnected = true
+    }
+
+    /// Where Chat Completions requests go: OpenAI (or a compatible endpoint), or Yandex Cloud
+    /// AI Studio when that backend is selected. Same request format, different auth and models.
+    private struct Endpoint {
+        let chatURL: URL
+        let headers: [String: String]
+        let textModel: String
+        let visionModel: String
+        /// api.openai.com wants max_completion_tokens; others keep max_tokens.
+        let usesCompletionTokens: Bool
+        let isYandex: Bool
+    }
+
+    private func endpoint() throws -> Endpoint {
+        if settings.aiBackend == .yandex {
+            guard settings.isYandexConfigured,
+                  let url = URL(string: YandexCloud.baseURL + "/chat/completions") else {
+                throw OpenAIError.notConfigured
+            }
+            return Endpoint(chatURL: url,
+                            headers: YandexCloud.headers(settings),
+                            textModel: YandexCloud.modelURI(settings.yandexTextModel, settings),
+                            visionModel: YandexCloud.modelURI(settings.yandexVisionModel, settings),
+                            usesCompletionTokens: false,
+                            isYandex: true)
+        }
+        guard settings.isOpenAIConfigured,
+              let url = URL(string: "\(settings.openAIBaseURL)/chat/completions") else {
+            throw OpenAIError.notConfigured
+        }
+        return Endpoint(chatURL: url,
+                        headers: ["Authorization": "Bearer \(settings.openAIAPIKey)"],
+                        textModel: settings.openAIModel,
+                        visionModel: settings.openAIModel,
+                        usesCompletionTokens: URL(string: settings.openAIBaseURL)?.host?.hasSuffix("openai.com") ?? false,
+                        isYandex: false)
     }
 
     /// Send a prompt (optionally with an image) and deliver the reply via `onAgentMessage`.
@@ -38,12 +75,9 @@ final class OpenAIService: ObservableObject {
     /// Send a prompt with several JPEG frames (oldest first) so the model sees what changed over
     /// the last seconds, not a single still.
     func sendMessage(_ text: String, images: [Data]) async throws {
-        guard settings.isOpenAIConfigured else { throw OpenAIError.notConfigured }
+        let endpoint = try endpoint()
         // Record the utterance for the tool registry's relative-time guard.
         NativeToolContext.shared.set(text)
-        guard let url = URL(string: "\(settings.openAIBaseURL)/chat/completions") else {
-            throw OpenAIError.badURL
-        }
 
         onProcessingChanged?(true)
         defer { onProcessingChanged?(false) }
@@ -126,26 +160,32 @@ final class OpenAIService: ObservableObject {
         // Web search + memory + on-device productivity tools (timers, reminders, calendar, notes…).
         let tools = [webSearchTool, rememberTool, forgetTool] + NativeToolRegistry.shared.openAISpecs
 
-        // OpenAI's current models take `max_completion_tokens` (newer ones reject `max_tokens`
-        // and spend part of the budget on reasoning); other compatible endpoints keep `max_tokens`.
-        let isOpenAIHost = URL(string: settings.openAIBaseURL)?.host?.hasSuffix("openai.com") ?? false
+        // Photos go to the image-capable model (Yandex has a separate one).
+        let model = images.isEmpty ? endpoint.textModel : endpoint.visionModel
+        // Yandex's OpenAI-compatible layer may not accept tools for every model; if it refuses,
+        // answer without them rather than not at all.
+        var useTools = true
 
         let maxIterations = 4
         for _ in 0..<maxIterations {
             var body: [String: Any] = [
-                "model": settings.openAIModel,
-                "messages": messages,
-                "tools": tools
+                "model": model,
+                "messages": messages
             ]
-            if isOpenAIHost {
+            if useTools { body["tools"] = tools }
+            // OpenAI's current models take `max_completion_tokens` (newer ones reject `max_tokens`
+            // and spend part of the budget on reasoning); other endpoints keep `max_tokens`.
+            if endpoint.usesCompletionTokens {
                 body["max_completion_tokens"] = 1500
             } else {
-                body["max_tokens"] = 400
+                body["max_tokens"] = endpoint.isYandex ? 1000 : 400
             }
-            var request = URLRequest(url: url)
+            var request = URLRequest(url: endpoint.chatURL)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue("Bearer \(settings.openAIAPIKey)", forHTTPHeaderField: "Authorization")
+            for (header, value) in endpoint.headers {
+                request.setValue(value, forHTTPHeaderField: header)
+            }
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.timeoutInterval = 60
 
@@ -153,6 +193,11 @@ final class OpenAIService: ObservableObject {
             guard let http = response as? HTTPURLResponse else { throw OpenAIError.noResponse }
             guard (200...299).contains(http.statusCode) else {
                 let detail = Self.errorMessage(from: data) ?? "HTTP \(http.statusCode)"
+                if endpoint.isYandex && useTools && http.statusCode == 400 {
+                    NSLog("[OpenAI] Yandex refused tools (%@) — retrying without them", detail)
+                    useTools = false
+                    continue
+                }
                 NSLog("[OpenAI] request failed: %@", detail)
                 throw OpenAIError.api(detail)
             }
@@ -270,15 +315,46 @@ final class OpenAIService: ObservableObject {
     }
 
     enum OpenAIError: LocalizedError {
+        // notConfigured covers both OpenAI and Yandex Cloud.
         case notConfigured, badURL, noResponse, emptyReply, api(String)
         var errorDescription: String? {
             switch self {
-            case .notConfigured: return "OpenAI isn't configured. Add your API key in Settings → OpenAI."
+            case .notConfigured: return "The AI backend isn't configured. Add the key in Settings → AI Backend."
             case .badURL: return "The OpenAI base URL is invalid."
             case .noResponse: return "No response from OpenAI."
             case .emptyReply: return "OpenAI returned an empty reply."
             case .api(let detail): return "OpenAI error: \(detail)"
             }
         }
+    }
+}
+
+// MARK: - Yandex Cloud
+
+/// Yandex Cloud AI Studio + SpeechKit connection details, shared by chat, web search and voice.
+enum YandexCloud {
+    /// OpenAI-compatible AI Studio endpoint (Chat Completions and Responses).
+    static let baseURL = "https://ai.api.cloud.yandex.net/v1"
+
+    /// SpeechKit REST synthesis (API v1: plain form request, MP3 out).
+    static let ttsURL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
+
+    /// API-key auth, the folder that is billed, and server-side request logging switched off
+    /// (Yandex keeps request logs by default; this header opts out).
+    @MainActor
+    static func headers(_ settings: AppSettings) -> [String: String] {
+        [
+            "Authorization": "Api-Key \(settings.yandexAPIKey.trimmingCharacters(in: .whitespacesAndNewlines))",
+            "OpenAI-Project": settings.yandexFolderID.trimmingCharacters(in: .whitespacesAndNewlines),
+            "x-data-logging-enabled": "false"
+        ]
+    }
+
+    /// "aliceai-llm" → "gpt://<folder>/aliceai-llm" (a full gpt:// URI is used as is).
+    @MainActor
+    static func modelURI(_ model: String, _ settings: AppSettings) -> String {
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        if model.hasPrefix("gpt://") { return model }
+        return "gpt://\(settings.yandexFolderID.trimmingCharacters(in: .whitespacesAndNewlines))/\(model)"
     }
 }

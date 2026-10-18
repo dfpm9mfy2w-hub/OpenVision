@@ -220,7 +220,7 @@ final class VoiceAgentViewModel: ObservableObject {
                         await OpenClawService.shared.disconnect()
                     case .geminiLive:
                         await GeminiLiveService.shared.disconnect()
-                    case .openAI:
+                    case .openAI, .yandex:
                         break   // stateless HTTP — nothing to disconnect
                     case .appleFoundation:
                         break   // OS-managed — nothing to disconnect
@@ -274,9 +274,9 @@ final class VoiceAgentViewModel: ObservableObject {
         // session — every "Ok Vision" starts a new session, so clearing here made "what were we
         // just talking about?" fail seconds after the previous answer. Only reset memory when
         // enough time has passed that History would start a new conversation anyway.
-        // The OpenAI assistant keeps its conversation across sessions and launches until the user
+        // The OpenAI / Yandex assistant keeps its conversation across sessions and launches until the user
         // says "новый разговор" — it is meant to remember, like OpenClaw's persistent session.
-        if !ConversationManager.shared.isCurrentConversationFresh && settingsManager.settings.aiBackend != .openAI {
+        if !ConversationManager.shared.isCurrentConversationFresh && ![.openAI, .yandex].contains(settingsManager.settings.aiBackend) {
             ConversationContext.shared.clear()
             AppleFoundationService.shared.resetContext()
         }
@@ -294,7 +294,7 @@ final class VoiceAgentViewModel: ObservableObject {
                     // ("что видишь", "посмотри", …) — see captureAndSendPhoto().
                     // User says "start video stream" → startLiveVideoMode()
 
-                case .openAI:
+                case .openAI, .yandex:
                     try await OpenAIService.shared.connect()
                     // Stateless HTTP — photos are captured on-demand like OpenClaw.
 
@@ -439,7 +439,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 await OpenClawService.shared.disconnect()
             case .geminiLive:
                 await GeminiLiveService.shared.disconnect()
-            case .openAI:
+            case .openAI, .yandex:
                 break   // stateless HTTP — nothing to disconnect
             case .appleFoundation:
                 break   // OS-managed — nothing to disconnect
@@ -500,7 +500,7 @@ final class VoiceAgentViewModel: ObservableObject {
             switch settingsManager.settings.aiBackend {
             case .openClaw: await OpenClawService.shared.interrupt()
             case .geminiLive: await GeminiLiveService.shared.interrupt()
-            case .openAI: break   // single request/response — nothing to interrupt
+            case .openAI, .yandex: break   // single request/response — nothing to interrupt
             case .appleFoundation: AppleFoundationService.shared.interrupt()
             case .localGemma: GemmaLocalService.shared.interrupt()
             }
@@ -690,7 +690,7 @@ final class VoiceAgentViewModel: ObservableObject {
                     await OpenClawService.shared.interrupt()
                 case .geminiLive:
                     await GeminiLiveService.shared.interrupt()
-                case .openAI:
+                case .openAI, .yandex:
                     break   // single request/response — nothing to interrupt
                 case .appleFoundation:
                     AppleFoundationService.shared.interrupt()
@@ -890,7 +890,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // The OpenClaw / OpenAI conversation persists across launches; let the user start over.
         let newConversationPhrases = ["новый разговор", "начнем сначала", "начнём сначала",
                                       "забудь разговор", "new conversation", "start over"]
-        if [.openClaw, .openAI].contains(settingsManager.settings.aiBackend),
+        if [.openClaw, .openAI, .yandex].contains(settingsManager.settings.aiBackend),
            newConversationPhrases.contains(where: { plainCommand.contains($0) }) {
             if settingsManager.settings.aiBackend == .openClaw {
                 OpenClawService.shared.startNewConversation()
@@ -2059,7 +2059,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 // VLM replies "I can't take photos / please provide an image" before describing.
                 let visionPrompt = visionPromptFromCommand(prompt)
                 let backendType = settingsManager.settings.aiBackend
-                if (backendType == .openClaw || backendType == .openAI) && !earlierFrames.isEmpty {
+                if [.openClaw, .openAI, .yandex].contains(backendType) && !earlierFrames.isEmpty {
                     let frames = earlierFrames + [imageData]
                     let isRussian = prompt.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
                     let note = isRussian
