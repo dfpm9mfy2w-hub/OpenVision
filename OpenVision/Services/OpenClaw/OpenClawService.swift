@@ -60,27 +60,44 @@ final class OpenClawService: ObservableObject {
     }
     private let deviceTokenKey = "OpenClaw.deviceToken"
 
+    /// Gateway-issued device token — a credential, so it lives in the Keychain.
     private var storedDeviceToken: String? {
         get {
-            UserDefaults.standard.string(forKey: deviceTokenKey)
+            Self.migrateFromUserDefaults(deviceTokenKey)
+            return KeychainStore.string(for: deviceTokenKey)
         }
         set {
-            UserDefaults.standard.set(newValue, forKey: deviceTokenKey)
+            KeychainStore.set(newValue ?? "", for: deviceTokenKey)
         }
     }
-        private let deviceIdentityKey = "OpenClaw.deviceIdentity"
 
-        private lazy var devicePrivateKey: Curve25519.Signing.PrivateKey = {
-            if let data = UserDefaults.standard.data(forKey: deviceIdentityKey),
-               let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: data) {
-                return key
-            }
+    private let deviceIdentityKey = "OpenClaw.deviceIdentity"
 
-            let key = Curve25519.Signing.PrivateKey()
-            UserDefaults.standard.set(key.rawRepresentation, forKey: deviceIdentityKey)
+    /// This phone's Ed25519 device identity — the gateway pairs on it, so it is kept (in the
+    /// Keychain, never in backups) and carried over unchanged from older builds' UserDefaults.
+    private lazy var devicePrivateKey: Curve25519.Signing.PrivateKey = {
+        Self.migrateFromUserDefaults(deviceIdentityKey)
+        if let data = KeychainStore.data(for: deviceIdentityKey),
+           let key = try? Curve25519.Signing.PrivateKey(rawRepresentation: data) {
             return key
-        }()
-        
+        }
+
+        let key = Curve25519.Signing.PrivateKey()
+        KeychainStore.set(key.rawRepresentation, for: deviceIdentityKey)
+        return key
+    }()
+
+    /// Older builds kept these in UserDefaults (plain plist, included in backups): move the value
+    /// into the Keychain once, then delete the plaintext copy.
+    private static func migrateFromUserDefaults(_ key: String) {
+        let defaults = UserDefaults.standard
+        guard let value = defaults.object(forKey: key) else { return }
+        let data = (value as? Data) ?? (value as? String).map { Data($0.utf8) }
+        if let data, KeychainStore.set(data, for: key) {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
     // MARK: - Callbacks
 
     /// Called when agent sends a text response

@@ -739,7 +739,7 @@ final class GemmaLocalService: ObservableObject {
     }
 
     func sendMessage(_ text: String, imageData: Data?, includeHistory: Bool) async throws {
-        NSLog("[OV] GemmaLocal sendMessage: \"%@\" — loaded: %@, image: %d bytes", text, modelContainer != nil ? "yes" : "no", imageData?.count ?? 0)
+        NSLog("[OV] GemmaLocal sendMessage: %d chars — loaded: %@, image: %d bytes", text.count, modelContainer != nil ? "yes" : "no", imageData?.count ?? 0)
         guard let container = modelContainer else {
             print("[GemmaLocal] ✗ model NOT loaded — throwing")
             throw GemmaLocalError.modelNotLoaded
@@ -996,7 +996,7 @@ final class GemmaLocalService: ObservableObject {
         guard let output = try? await rawGenerate(messages: messages, maxTokens: 60, temperature: 0.0) else {
             return nil
         }
-        NSLog("[OV] classifyFaceIntent(\"%@\") -> %@", command, output)
+        NSLog("[OV] classifyFaceIntent -> %@", output)
         // Extract the first {...} JSON object from the output.
         guard let start = output.firstIndex(of: "{"), let end = output.lastIndex(of: "}"),
               start < end,

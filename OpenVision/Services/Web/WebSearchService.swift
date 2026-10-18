@@ -1,5 +1,5 @@
 // OpenVision - WebSearchService.swift
-// Free web search via DuckDuckGo — no API key.
+// Web search: Tavily or OpenAI web search when their keys are set, otherwise free DuckDuckGo.
 //
 // Two-stage: (1) the Instant Answer API for clean facts/definitions/calculations, then
 // (2) the real search endpoint (html.duckduckgo.com) parsed for result snippets, which DOES
@@ -21,12 +21,66 @@ enum WebSearchService {
         if let tavily = await tavilySearch(trimmed), !tavily.isEmpty {
             return tavily
         }
-        // 2) DuckDuckGo Instant Answer — clean facts / definitions / math (no key).
+        // 2) OpenAI web search — when the assistant itself runs on an OpenAI key, search rides on
+        //    the same account and bill (good for weather, news, prices). Skipped otherwise.
+        if let openAI = await openAIWebSearch(trimmed), !openAI.isEmpty {
+            return openAI
+        }
+        // 3) DuckDuckGo Instant Answer — clean facts / definitions / math (no key).
         if let instant = await instantAnswer(trimmed), !instant.isEmpty {
             return instant
         }
-        // 3) DuckDuckGo HTML result snippets (no key; weak for live data).
+        // 4) DuckDuckGo HTML result snippets (no key; weak for live data).
         return await htmlResults(trimmed)
+    }
+
+    // MARK: - OpenAI web search (Responses API)
+
+    /// Ask OpenAI's built-in web search for current facts. Only for the official OpenAI endpoint
+    /// with a key set; returns nil on any failure so the free fallbacks still run.
+    private static func openAIWebSearch(_ query: String) async -> String? {
+        let (key, base, model) = await MainActor.run {
+            let settings = SettingsManager.shared.settings
+            return (settings.openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    settings.openAIBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/ ")),
+                    settings.openAIModel)
+        }
+        guard !key.isEmpty,
+              URL(string: base)?.host?.hasSuffix("openai.com") == true,
+              let url = URL(string: base + "/responses") else { return nil }
+
+        // "web_search" is the current tool name; older deployments only know the preview one.
+        for toolType in ["web_search", "web_search_preview"] {
+            let body: [String: Any] = [
+                "model": model,
+                "tools": [["type": toolType]],
+                "input": "Search the web and report the current facts for: \(query)\nReply concisely with concrete numbers, dates and places.",
+                "max_output_tokens": 1500
+            ]
+            guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+            request.httpBody = payload
+            request.timeoutInterval = 30
+
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  let status = (response as? HTTPURLResponse)?.statusCode else { return nil }
+            if status == 400 { continue }   // tool type (or model) not supported — try the next
+            guard status == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                print("[WebSearch] OpenAI web search HTTP \(status)")
+                return nil
+            }
+            if let text = obj["output_text"] as? String, !text.isEmpty { return text }
+            let texts = (obj["output"] as? [[String: Any]] ?? [])
+                .flatMap { $0["content"] as? [[String: Any]] ?? [] }
+                .compactMap { $0["type"] as? String == "output_text" ? $0["text"] as? String : nil }
+            let joined = texts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            return joined.isEmpty ? nil : joined
+        }
+        return nil
     }
 
     // MARK: - Tavily (primary when a key is set)
@@ -75,7 +129,7 @@ enum WebSearchService {
             }
             let combined = String(parts.joined(separator: "\n").prefix(2600))
             if !combined.isEmpty {
-                NSLog("[OV] Tavily hit: %d chars (%d results) for \"%@\"", combined.count, (json["results"] as? [[String: Any]])?.count ?? 0, query)
+                NSLog("[OV] Tavily hit: %d chars (%d results)", combined.count, (json["results"] as? [[String: Any]])?.count ?? 0)
             }
             return combined.isEmpty ? nil : combined
         } catch {
@@ -135,7 +189,7 @@ enum WebSearchService {
             }
             let snippets = parseSnippets(from: html, limit: 5)
             if snippets.isEmpty {
-                NSLog("[OV] web search (html): no snippets parsed for \"%@\"", query)
+                NSLog("[OV] web search (html): no snippets parsed")
                 return ""
             }
             return snippets.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")

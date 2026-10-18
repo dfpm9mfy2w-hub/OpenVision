@@ -12,40 +12,64 @@ import Foundation
 final class ConversationContext {
     static let shared = ConversationContext()
 
-    struct Turn { let role: String; let content: String }   // role: "user" | "assistant"
+    struct Turn: Codable { let role: String; let content: String }   // role: "user" | "assistant"
 
-    private(set) var turns: [Turn] = []
+    /// Recent exchanges, persisted so a conversation survives app restarts (cleared by
+    /// "новый разговор" or an explicit `clear()`).
+    private var stored: [Turn] = [] {
+        didSet { save() }
+    }
 
-    /// Keep the last few exchanges — enough for natural follow-ups, bounded so local models stay
-    /// well within their memory/context budget.
+    /// The short window local models get — bounded so they stay within their memory/context budget.
+    var turns: [Turn] { Array(stored.suffix(maxMessages)) }
+
+    /// Everything kept, for cloud models with a large context (OpenAI).
+    var allTurns: [Turn] { stored }
+
     private let maxMessages = 8
+    private let maxStoredMessages = 24
+    private static let defaultsKey = "ConversationContext.turns"
 
-    private init() {}
+    private init() {
+        if let data = UserDefaults.standard.data(forKey: Self.defaultsKey),
+           let saved = try? JSONDecoder().decode([Turn].self, from: data) {
+            stored = saved
+        }
+    }
 
     func record(user: String, assistant: String) {
         append(role: "user", content: user)
         append(role: "assistant", content: assistant)
     }
 
-    func clear() { turns.removeAll() }
+    func clear() { stored.removeAll() }
 
     /// Resume a past conversation from History: reload its recent exchanges as live context so
     /// follow-up questions pick up where that conversation left off.
     func seed(from conversation: Conversation) {
-        turns.removeAll()
-        for message in conversation.messages.suffix(maxMessages) {
+        var seeded: [Turn] = []
+        for message in conversation.messages.suffix(maxStoredMessages) {
             switch message.role {
-            case .user: append(role: "user", content: message.content)
-            case .assistant: append(role: "assistant", content: message.content)
+            case .user: seeded.append(Turn(role: "user", content: message.content))
+            case .assistant: seeded.append(Turn(role: "assistant", content: message.content))
             default: break
             }
         }
+        stored = seeded
     }
 
     private func append(role: String, content: String) {
         let clean = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
-        turns.append(Turn(role: role, content: clean))
-        if turns.count > maxMessages { turns.removeFirst(turns.count - maxMessages) }
+        var updated = stored
+        updated.append(Turn(role: role, content: clean))
+        if updated.count > maxStoredMessages { updated.removeFirst(updated.count - maxStoredMessages) }
+        stored = updated
+    }
+
+    private func save() {
+        if let data = try? JSONEncoder().encode(stored) {
+            UserDefaults.standard.set(data, forKey: Self.defaultsKey)
+        }
     }
 }

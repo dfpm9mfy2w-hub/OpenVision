@@ -240,7 +240,7 @@ enum LocalAgent {
     /// Turn the model's raw output into a RouteResult (parse face/search/tool JSON, else answer).
     private static func resolve(_ output: String, command: String) async -> RouteResult {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        NSLog("[OV] route(\"%@\") -> %@", command, String(trimmed.prefix(120)))
+        NSLog("[OV] route -> %@", String(trimmed.prefix(40)))
         if let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}"), start < end,
            let data = String(trimmed[start...end]).data(using: .utf8),
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {

@@ -90,6 +90,10 @@ struct AppSettings: Codable, Equatable {
     /// Chat model id. gpt-4o-mini is cheap and supports vision — a good default for testing.
     var openAIModel: String = "gpt-4o-mini"
 
+    /// Who the assistant is in the direct OpenAI mode — name, manner, how it addresses the user.
+    /// Custom Instructions are appended after it.
+    var assistantPersona: String = "Тебя зовут Дубина. Ты — голосовой ИИ-ассистент в умных очках Ray-Ban Meta, в духе невозмутимого ИИ-дворецкого: спокойный, учтивый, уверенный, с лёгкой сдержанной иронией; сарказм и фамильярность — нет. Обращайся к пользователю «сэр». Отвечай на языке пользователя (обычно по-русски)."
+
     /// API base URL. Override to point at any OpenAI-compatible endpoint (OpenRouter, a local
     /// server, Azure-style gateways, etc.). No trailing slash.
     var openAIBaseURL: String = "https://api.openai.com/v1"

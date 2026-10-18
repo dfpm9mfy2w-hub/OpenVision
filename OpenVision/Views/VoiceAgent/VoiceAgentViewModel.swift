@@ -138,6 +138,7 @@ final class VoiceAgentViewModel: ObservableObject {
 
             // Resume barge-in detection
             voiceCommandService.isBargeInPaused = false
+            visionAnswerFinishedIfNeeded()
 
             if isSessionActive {
                 agentState = .listening
@@ -164,6 +165,7 @@ final class VoiceAgentViewModel: ObservableObject {
             commandTurnActive = false   // reply fully played; ambient narration may resume
 
             voiceCommandService.isBargeInPaused = false
+            visionAnswerFinishedIfNeeded()
             if isSessionActive {
                 agentState = .listening
                 resumeListeningAfterSpeaking()
@@ -206,8 +208,8 @@ final class VoiceAgentViewModel: ObservableObject {
                 print("[VoiceAgent] Voice service idle, stopping session")
                 isSessionActive = false
                 agentState = .idle
-                // The camera may be warm from this conversation — switch it off with the session.
-                cameraIdleTask?.cancel()
+                // The camera may still be on for a vision request — switch it off with the session.
+                endVisionAndCamera()
                 if glassesManager.isStreaming {
                     Task { await glassesManager.stopStreaming() }
                 }
@@ -272,7 +274,9 @@ final class VoiceAgentViewModel: ObservableObject {
         // session — every "Ok Vision" starts a new session, so clearing here made "what were we
         // just talking about?" fail seconds after the previous answer. Only reset memory when
         // enough time has passed that History would start a new conversation anyway.
-        if !ConversationManager.shared.isCurrentConversationFresh {
+        // The OpenAI assistant keeps its conversation across sessions and launches until the user
+        // says "новый разговор" — it is meant to remember, like OpenClaw's persistent session.
+        if !ConversationManager.shared.isCurrentConversationFresh && settingsManager.settings.aiBackend != .openAI {
             ConversationContext.shared.clear()
             AppleFoundationService.shared.resetContext()
         }
@@ -286,21 +290,8 @@ final class VoiceAgentViewModel: ObservableObject {
                 switch settingsManager.settings.aiBackend {
                 case .openClaw:
                     try await OpenClawService.shared.connect()
-                    // Warm the glasses camera in the background so the first "what do you see"
-                    // answers about the current view without the ~5 s camera start. It switches
-                    // off after a quiet period (keepCameraWarm) or when the session ends.
-                    if glassesManager.isRegistered {
-                        Task { [weak self] in
-                            guard let self else { return }
-                            await self.glassesManager.startStreaming()
-                            if self.isSessionActive {
-                                self.keepCameraWarm()
-                            } else if !self.isLiveVideoMode {
-                                // The conversation ended ("стоп") while the camera was starting.
-                                await self.glassesManager.stopStreaming()
-                            }
-                        }
-                    }
+                    // The camera is NOT started here: it turns on only for a vision request
+                    // ("что видишь", "посмотри", …) — see captureAndSendPhoto().
                     // User says "start video stream" → startLiveVideoMode()
 
                 case .openAI:
@@ -330,6 +321,7 @@ final class VoiceAgentViewModel: ObservableObject {
                 agentState = .listening
                 userTranscript = ""
                 aiTranscript = ""
+                warnIfSigningExpiresSoon()
 
                 // Start voice command listening for speech capture
                 if voiceCommandService.authorizationStatus == .authorized {
@@ -347,6 +339,40 @@ final class VoiceAgentViewModel: ObservableObject {
                 isSessionActive = false
                 agentState = .idle
             }
+        }
+    }
+
+    // MARK: - Signing expiry
+
+    /// Last time the signing warning was spoken (at most twice a day).
+    private var lastSigningWarning: Date = .distantPast
+
+    /// Days left on this build's signing profile. Builds signed with a free Apple account carry a
+    /// 7-day profile and stop launching when it lapses; nil when there is no embedded profile.
+    static func signingDaysLeft() -> Int? {
+        guard let url = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
+              let data = try? Data(contentsOf: url),
+              let start = data.range(of: Data("<?xml".utf8)),
+              let end = data.range(of: Data("</plist>".utf8), in: start.lowerBound..<data.endIndex),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data.subdata(in: start.lowerBound..<end.upperBound), format: nil) as? [String: Any],
+              let expiry = plist["ExpirationDate"] as? Date else { return nil }
+        return Calendar.current.dateComponents([.day], from: Date(), to: expiry).day
+    }
+
+    /// The Mac renews the signature automatically when the phone is nearby; if that hasn't
+    /// happened and the app is about to stop launching, say so at the start of a conversation.
+    private func warnIfSigningExpiresSoon() {
+        guard let days = Self.signingDaysLeft(), days <= 2,
+              Date().timeIntervalSince(lastSigningWarning) > 12 * 3600 else { return }
+        lastSigningWarning = Date()
+        NSLog("[OV] signing profile expires in %d day(s)", days)
+        if voiceCommandService.recognitionLocaleID == "ru-RU" {
+            let when = days <= 0 ? "сегодня" : (days == 1 ? "завтра" : "через два дня")
+            speakResponse("Сэр, напоминаю: подпись приложения истекает \(when). Включите Mac и оставьте телефон рядом с ним — я обновлюсь сам.")
+        } else {
+            let when = days <= 0 ? "today" : (days == 1 ? "tomorrow" : "in two days")
+            speakResponse("Sir, a reminder: the app's signature expires \(when). Keep the phone near your Mac and I'll renew myself.")
         }
     }
 
@@ -424,7 +450,7 @@ final class VoiceAgentViewModel: ObservableObject {
             }
 
             // Stop glasses streaming (turns off LED)
-            cameraIdleTask?.cancel()
+            endVisionAndCamera()
             if glassesManager.isStreaming {
                 print("[VoiceAgent] Stopping glasses stream...")
                 await glassesManager.stopStreaming()
@@ -861,12 +887,16 @@ final class VoiceAgentViewModel: ObservableObject {
             return
         }
 
-        // The OpenClaw conversation now persists across launches; let the user start over.
+        // The OpenClaw / OpenAI conversation persists across launches; let the user start over.
         let newConversationPhrases = ["новый разговор", "начнем сначала", "начнём сначала",
                                       "забудь разговор", "new conversation", "start over"]
-        if settingsManager.settings.aiBackend == .openClaw,
+        if [.openClaw, .openAI].contains(settingsManager.settings.aiBackend),
            newConversationPhrases.contains(where: { plainCommand.contains($0) }) {
-            OpenClawService.shared.startNewConversation()
+            if settingsManager.settings.aiBackend == .openClaw {
+                OpenClawService.shared.startNewConversation()
+            } else {
+                ConversationContext.shared.clear()
+            }
             let isRussian = command.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
             speakResponse(isRussian ? "Как скажете, сэр. Начинаем с чистого листа." : "As you wish, sir. Starting fresh.")
             return
@@ -1001,9 +1031,21 @@ final class VoiceAgentViewModel: ObservableObject {
                             "what am i looking at", "can you see",
                             "сфотографируй", "сделай фото", "сделай снимок", "что ты видишь",
                             "что видишь", "перед собой", "передо мной", "перед тобой",
-                            "посмотри на это", "что это такое", "на что я смотрю", "опиши"]
+                            "посмотри на это", "что это такое", "на что я смотрю", "опиши",
+                            "посмотри", "глянь", "взгляни", "смотри на", "видишь", "что это за",
+                            "что там", "что вокруг", "что впереди", "что здесь", "что тут",
+                            "прочитай", "прочти", "что написано", "какого цвета", "какой цвет",
+                            "кто это", "кто там", "узнаешь", "сколько здесь", "сколько тут",
+                            "сними", "покажи что"]
 
-        let isPhotoCommand = photoKeywords.contains { lowerCommand.contains($0) }
+        // Bare "что это?" is a vision question; "что это значит?" is not — so only short ones.
+        let plainWords = plainCommand.split(separator: " ")
+        let isShortWhatIsThis = plainWords.count <= 3 && plainCommand.contains("что это")
+        // Right after a vision answer the camera is still on: a follow-up ("а слева?") is
+        // about the same view, so it gets a frame too.
+        let isVisionFollowUp = isSessionActive && glassesManager.isStreaming && Date() < visionFollowUpUntil
+        let isPhotoCommand = photoKeywords.contains { plainCommand.contains($0) || lowerCommand.contains($0) }
+            || isShortWhatIsThis || isVisionFollowUp
 
         // Drive whichever backend is selected through the AIBackend protocol — capabilities
         // (localLLM, supportsImageInput) decide the path, not concrete service types.
@@ -1823,7 +1865,7 @@ final class VoiceAgentViewModel: ObservableObject {
             await handleFaceIntent(intent)
         case .webSearch(let query):
             if ttsStreaming { ttsService.stop(); ttsStreaming = false }
-            NSLog("[OV] web search: \"%@\"", query)
+            NSLog("[OV] web search (%d chars)", query.count)
             var result = await WebSearchService.search(query)
             // Agentic retry: if the first query found nothing, let the model reformulate once.
             if result.isEmpty, let better = await llm.reformulateSearchQuery(question: command, triedQuery: query) {
@@ -1914,20 +1956,49 @@ final class VoiceAgentViewModel: ObservableObject {
         try await backend.sendMessage(prompt, imageData: backend.supportsImageInput ? imageData : nil)
     }
 
-    /// Switches the warm camera off after this long without a vision question (battery, LED).
-    private static let cameraIdleTimeout: TimeInterval = 300
+    /// After a vision answer has been spoken, the camera stays on this long so a follow-up
+    /// ("а слева что?") is answered from the current view; then it switches off.
+    private static let visionFollowUpWindow: TimeInterval = 20
 
-    private var cameraIdleTask: Task<Void, Never>?
+    /// Safety net: a vision request that never produces a spoken answer (error, no reply)
+    /// still switches the camera off after this long.
+    private static let visionRequestMaxDuration: TimeInterval = 120
 
-    /// Keep the glasses camera streaming for now, and (re)arm its idle switch-off.
-    private func keepCameraWarm() {
-        cameraIdleTask?.cancel()
-        cameraIdleTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.cameraIdleTimeout * 1_000_000_000))
+    private var cameraOffTask: Task<Void, Never>?
+
+    /// True from a vision question until its answer has finished speaking — the camera must
+    /// not switch off in between.
+    private var visionRequestInFlight = false
+
+    /// Until this moment any question counts as a vision follow-up (the camera is still on).
+    private var visionFollowUpUntil: Date = .distantPast
+
+    /// (Re)arm the camera switch-off.
+    private func scheduleCameraOff(after seconds: TimeInterval) {
+        cameraOffTask?.cancel()
+        cameraOffTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard let self, !Task.isCancelled, !self.isLiveVideoMode, self.glassesManager.isStreaming else { return }
-            NSLog("[OV] camera idle for %.0f s — switching it off", Self.cameraIdleTimeout)
+            NSLog("[OV] vision request finished — switching camera off")
+            self.visionRequestInFlight = false
             await self.glassesManager.stopStreaming()
         }
+    }
+
+    /// The reply finished speaking: if it answered a vision request, keep the camera for the
+    /// follow-up window and then switch it off.
+    private func visionAnswerFinishedIfNeeded() {
+        guard visionRequestInFlight else { return }
+        visionRequestInFlight = false
+        visionFollowUpUntil = Date().addingTimeInterval(Self.visionFollowUpWindow)
+        scheduleCameraOff(after: Self.visionFollowUpWindow)
+    }
+
+    /// Session over: drop vision state and switch the camera off now.
+    private func endVisionAndCamera() {
+        cameraOffTask?.cancel()
+        visionRequestInFlight = false
+        visionFollowUpUntil = .distantPast
     }
 
     private func captureAndSendPhoto(withPrompt prompt: String) async {
@@ -1968,11 +2039,13 @@ final class VoiceAgentViewModel: ObservableObject {
         // before the (multi-second) model inference — so the LED doesn't stay on. Repeat photo
         // commands restart the camera reliably via freshLiveFrame(). Skip in live video mode.
         //
-        // Inside a conversation the camera stays on instead, so the next "what do you see" gets
-        // the current view at once (no ~5 s warm-up); it switches off after a quiet period.
+        // Inside a conversation the camera instead stays on until this vision request's answer
+        // has been spoken (plus a short follow-up window), then switches off.
         if imageData != nil && glassesManager.isStreaming && !isLiveVideoMode {
             if isSessionActive {
-                keepCameraWarm()
+                // Keep it on until the answer has been spoken (visionAnswerFinishedIfNeeded).
+                visionRequestInFlight = true
+                scheduleCameraOff(after: Self.visionRequestMaxDuration)
             } else {
                 NSLog("[OV] photo captured — stopping camera (click and go)")
                 await glassesManager.stopStreaming()
@@ -1985,20 +2058,26 @@ final class VoiceAgentViewModel: ObservableObject {
                 // The image is attached, so strip the "take a picture" wording — otherwise the
                 // VLM replies "I can't take photos / please provide an image" before describing.
                 let visionPrompt = visionPromptFromCommand(prompt)
-                if settingsManager.settings.aiBackend == .openClaw && !earlierFrames.isEmpty {
+                let backendType = settingsManager.settings.aiBackend
+                if (backendType == .openClaw || backendType == .openAI) && !earlierFrames.isEmpty {
                     let frames = earlierFrames + [imageData]
                     let isRussian = prompt.unicodeScalars.contains { (0x0400...0x04FF).contains($0.value) }
                     let note = isRussian
                         ? "\n\n(Приложено \(frames.count) кадра с камеры очков за последние пару секунд, по порядку; последний — то, что перед пользователем прямо сейчас. Отвечай про текущий вид, а движение и изменения бери из предыдущих кадров.)"
                         : "\n\n(Attached are \(frames.count) frames from the glasses camera over the last couple of seconds, in order; the last one is what is in front of the user right now. Answer about the current view and use the earlier frames for motion and changes.)"
-                    NSLog("[OV] Sending message with %d frames, prompt: \"%@\"", frames.count, visionPrompt)
-                    try await OpenClawService.shared.sendMessage(visionPrompt + note, images: frames)
+                    NSLog("[OV] Sending message with %d frames (prompt %d chars)", frames.count, visionPrompt.count)
+                    if backendType == .openClaw {
+                        try await OpenClawService.shared.sendMessage(visionPrompt + note, images: frames)
+                    } else {
+                        try await OpenAIService.shared.sendMessage(visionPrompt + note, images: frames)
+                    }
                 } else {
-                    NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
+                    NSLog("[OV] Sending message with photo (%d bytes, prompt %d chars)", imageData.count, visionPrompt.count)
                     try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
                 }
             } else {
                 NSLog("[OV] No image available — capture returned nil; NOT sending to model")
+                if isSessionActive { scheduleCameraOff(after: 0) }
                 // Don't send a degraded text-only prompt to the model — that's what makes it
                 // reply "please provide an image". Tell the user directly and stop.
                 errorMessage = "Couldn't capture a photo (streaming: \(glassesManager.isStreaming ? "on" : "off"), registered: \(glassesManager.isRegistered ? "yes" : "no")). Try again."
@@ -2011,6 +2090,7 @@ final class VoiceAgentViewModel: ObservableObject {
             errorMessage = "Failed to send: \(error.localizedDescription)"
             agentState = isSessionActive ? .listening : .idle
 
+            visionRequestInFlight = false
             // Stop streaming on error if we started it for this photo
             if startedStreamingForPhoto && glassesManager.isStreaming {
                 await glassesManager.stopStreaming()
